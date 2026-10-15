@@ -6778,8 +6778,8 @@ def tool_forget_correction(args: dict) -> str:
     if not heard:
         return "Tell me which hearing to forget, sir."
     if forget_correction(heard):
-        return f"Forgotten, sir — '{heard}' no longer rewrites anything."
-    return f"I have no correction for '{heard}', sir."
+        return f"Forgotten, sir — '{_safe_label(heard)}' no longer rewrites anything."
+    return f"I have no correction for '{_safe_label(heard)}', sir."
 
 
 def tool_list_corrections(args: dict) -> str:
