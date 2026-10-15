@@ -85,21 +85,52 @@ async def test_client_parameter_is_accepted_for_compatibility():
     assert sig.parameters["client"].default is None
 
 
-@pytest.mark.asyncio
-async def test_voice_override_takes_precedence():
+def test_voice_override_takes_precedence(monkeypatch):
     """When voice_override is set, it should be used instead of language-based selection."""
+    import sys
+    import types
+    import asyncio
     import tts
-    # Just verify the logic path: voice_override skips VOICE_MAP lookup
-    voice_name = "custom-voice"
-    assert voice_name == voice_name  # structural — real test needs network
+    seen = {}
+
+    class FakeCommunicate:
+        def __init__(self, text, voice):
+            seen["voice"] = voice
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"1234"}
+            return
+
+    fake_mod = types.ModuleType("edge_tts")
+    fake_mod.Communicate = FakeCommunicate
+    monkeypatch.setitem(sys.modules, "edge_tts", fake_mod)
+    r = asyncio.run(tts.synthesize_chunk("halo", language="id", voice_override="custom-voice"))
+    assert r is not None and r.audio == b"1234"
+    assert seen["voice"] == "custom-voice"
 
 
-@pytest.mark.asyncio
-async def test_falls_back_to_english_for_unknown_language():
+def test_falls_back_to_english_for_unknown_language(monkeypatch):
     """Unknown language codes fall back to the default English voice."""
+    import sys
+    import types
+    import asyncio
     import tts
-    voice_name = tts.VOICE_MAP.get("xx", tts.VOICE_MAP[tts.DEFAULT_LANGUAGE])
-    assert voice_name == "en-US-GuyNeural"
+    seen = {}
+
+    class FakeCommunicate:
+        def __init__(self, text, voice):
+            seen["voice"] = voice
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"1234"}
+            return
+
+    fake_mod = types.ModuleType("edge_tts")
+    fake_mod.Communicate = FakeCommunicate
+    monkeypatch.setitem(sys.modules, "edge_tts", fake_mod)
+    r = asyncio.run(tts.synthesize_chunk("hello", language="xx"))
+    assert r is not None and r.audio == b"1234"
+    assert seen["voice"] == "en-US-GuyNeural"
 
 
 def test_voice_env_override_wins_over_map(monkeypatch):

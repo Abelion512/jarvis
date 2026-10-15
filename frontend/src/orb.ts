@@ -9,6 +9,7 @@
 import * as THREE from "three";
 
 // ponytail: hoisted — the animate loop allocated 2 Colors per frame (120/s GC churn).
+// No ceiling: lerp reads the const, never mutates it — pixel-identical output.
 const COL_THINK = new THREE.Color(0x6ec4ff);
 const COL_SPEAK = new THREE.Color(0x5ab8f0);
 const COL_COMPACT = new THREE.Color(0x3a5f8a);
@@ -243,6 +244,7 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
       const maxDistSq = maxDist * maxDist;
       // ponytail: 667 sampled points = ~222k checks/frame (~13ms, blows the
       // 16ms frame budget). 250 sampled = ~31k checks/frame (~2ms), same look.
+      // Ceiling: sparser lines if N grows a lot; revisit if N or line look changes.
       const step = Math.max(1, Math.floor(N / 250));
 
       for (let i = 0; i < N && lineCount < MAX_LINES; i += step) {
