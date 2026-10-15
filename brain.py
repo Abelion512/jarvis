@@ -1,6 +1,8 @@
 """
 brain.py — JARVIS's brain: one long-lived `claude -p` process on the user's
-Claude subscription, fed over stdin as stream-json.
+Claude subscription, fed over stdin as stream-json — or, when JARVIS_CLI_PATH
+points at Hermes Agent, one `hermes chat` subprocess per turn with the
+conversation carried by `--resume <session_id>`.
 
 No Anthropic API. Lean flags (no user hooks, no user MCP servers, coding tools
 disallowed) keep a turn at ~13k context tokens with sub-second first tokens
@@ -26,9 +28,15 @@ import usage_store
 
 log = logging.getLogger("jarvis.brain")
 
-# The brain runs on the user's Claude subscription — never on an API key. Any of
-# these in the server's environment (they come from .env for Fish/other features)
+# The brain runs on the user's subscription — never on an API key. Any of
+# these in the server's environment (they come from .env for other features)
 # would make the CLI authenticate with the key instead of the login.
+#
+# SUPPORTED CLI TOOLS (configured via JARVIS_CLI_PATH):
+#   - claude (default): Claude Code, requires ANTHROPIC_* scrub
+#   - hermes: Hermes Agent, also requires ANTHROPIC_* scrub when using
+#     Anthropic provider. Other providers (Nous, OpenRouter, etc.) have
+#     their own auth mechanisms.
 #
 # Re-exported from claude_env, which is where the scrub now lives: the run
 # pipeline needs exactly the same one, and the first copy of this rule was
@@ -72,6 +80,9 @@ ALLOWED_TOOLS = [
     "mcp__jarvis__open_in_editor",
     "mcp__jarvis__remember",
     "mcp__jarvis__recall",
+    "mcp__jarvis__learn_correction",
+    "mcp__jarvis__forget_correction",
+    "mcp__jarvis__list_corrections",
     "mcp__jarvis__project_note",
     "mcp__jarvis__write_journal",
     # The CLI's own two, and the only non-JARVIS tools here. JARVIS could read
@@ -122,7 +133,7 @@ def granted_tools(connections: list[str]) -> list[str]:
 # Tools whose results put text from the open web into the brain's context. A
 # turn that has used one may not also act unsupervised (server.py gates it);
 # `_handle` sees them in the CLI's own tool_use events.
-WEB_CONTENT_TOOLS = {"WebSearch", "WebFetch"}
+WEB_CONTENT_TOOLS = {"WebSearch", "WebFetch", "web_search", "web_fetch"}
 
 
 def untrusted_tool_source(name: str) -> Optional[str]:
@@ -290,6 +301,9 @@ class BrainConfig:
     model: str = "sonnet"
     effort: str = "low"
     claude_path: Optional[str] = None
+    cli_path: Optional[str] = None
+    cli_args: list[str] = field(default_factory=list)
+    provider: Optional[str] = None
     turn_timeout: float = 90.0
     warmup_timeout: float = 45.0
     max_restarts: int = 3
@@ -306,13 +320,30 @@ class BrainConfig:
 
     @classmethod
     def from_env(cls, home: Path) -> "BrainConfig":
+        cli_path = os.getenv("JARVIS_CLI_PATH") or os.getenv("JARVIS_CLAUDE_PATH") or None
+        is_hermes = bool(cli_path and "hermes" in cli_path)
+        default_model = "kgw/kilo-auto/free" if is_hermes else "sonnet"
+        # Hermes pays ~15-30s of plugin/MCP init per spawn; a Claude-sized
+        # warm-up budget would kill every first turn. Overridable.
+        default_warmup = "120" if is_hermes else "45"
+        # Same init cost applies to every one-shot turn, not just warm-up.
+        default_turn = "150" if is_hermes else "90"
+        # Hermes re-sends persona + resumed history every turn over
+        # `--resume`, so a Claude-sized budget lets the window overrun the
+        # model's context (and every turn prefills the whole thing — the
+        # latency you feel). Rotate an order of magnitude sooner.
+        default_budget = "28000" if is_hermes else "120000"
         return cls(
             home=home,
-            model=os.getenv("JARVIS_BRAIN_MODEL", "sonnet"),
+            model=os.getenv("JARVIS_BRAIN_MODEL", default_model),
             effort=os.getenv("JARVIS_BRAIN_EFFORT", "low"),
             claude_path=os.getenv("JARVIS_CLAUDE_PATH") or None,
-            turn_timeout=float(os.getenv("JARVIS_BRAIN_TURN_TIMEOUT", "90")),
-            context_budget=int(os.getenv("JARVIS_BRAIN_CONTEXT_BUDGET", "120000")),
+            cli_path=cli_path,
+            cli_args=os.getenv("JARVIS_CLI_EXTRA_ARGS", "").split() if os.getenv("JARVIS_CLI_EXTRA_ARGS") else [],
+            provider=os.getenv("JARVIS_HERMES_PROVIDER") or None,
+            turn_timeout=float(os.getenv("JARVIS_BRAIN_TURN_TIMEOUT", default_turn)),
+            warmup_timeout=float(os.getenv("JARVIS_BRAIN_WARMUP_TIMEOUT", default_warmup)),
+            context_budget=int(os.getenv("JARVIS_BRAIN_CONTEXT_BUDGET", default_budget)),
             user_name=os.getenv("USER_NAME", ""),
         )
 
@@ -334,7 +365,7 @@ class TurnResult:
 class _Turn:
     """Bookkeeping for the one turn in flight."""
 
-    on_tool: Optional[Callable[[], None]] = None
+    on_tool: Optional[Callable[..., None]] = None
 
     def __init__(self, origin: str, on_delta: Optional[DeltaCallback],
                  proc: Optional[asyncio.subprocess.Process] = None):
@@ -396,7 +427,8 @@ class _Turn:
 class Brain:
     def __init__(self, config: BrainConfig):
         self.config = config
-        self._claude = config.claude_path or shutil.which("claude") or "claude"
+        self._cli = config.cli_path or config.claude_path or shutil.which("claude") or "claude"
+        self._hermes_proc = None
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader: Optional[asyncio.Task] = None
         self._turn_lock = asyncio.Lock()
@@ -465,10 +497,14 @@ class Brain:
 
     @property
     def running(self) -> bool:
+        if self.is_hermes:
+            return not self._stopping and not self._failed
         return self._proc is not None and self._proc.returncode is None
 
     @property
     def ready(self) -> bool:
+        if self.is_hermes:
+            return not self._stopping and not self._failed and self._ready
         return self.running and self._ready
 
     @property
@@ -633,6 +669,35 @@ class Brain:
                 and self._turns_since_pending >= self.config.max_turns_before_forced_rotation)
 
     # ── command construction ───────────────────────────────────────────
+    @staticmethod
+    def _is_hermes_cmd(cmd: str) -> bool:
+        """The resolved binary names Hermes. Stems of argv[0] (and argv[1]
+        for `python /path/fake_hermes.py`-style invocations, tests included),
+        not substring: `/home/hermes_user/claude` must not route to
+        `hermes chat`, while a wrapper directory may be anything."""
+        from pathlib import Path
+        parts = shlex.split(cmd)[:2]
+        return any("hermes" in Path(p).stem for p in parts)
+
+    @property
+    def is_hermes(self) -> bool:
+        """True when the configured CLI is Hermes Agent, not Claude Code."""
+        return self._is_hermes_cmd(self._cli)
+
+    @property
+    def cli_command(self) -> list[str]:
+        """The CLI binary, without flags (e.g. ['hermes'] or ['claude'])."""
+        return shlex.split(self._cli)
+
+    @property
+    def _claude(self) -> str:
+        """Legacy spelling of the CLI binary path. Kept for tests/callers."""
+        return self._cli
+
+    @_claude.setter
+    def _claude(self, value: str) -> None:
+        self._cli = value
+
     def _boot_handover(self) -> Optional[str]:
         """The last real handover on disk, for a generation that inherited
         none in-process.
@@ -741,8 +806,10 @@ class Brain:
         return base
 
     def command(self) -> list[str]:
+        if self.is_hermes:
+            return self._hermes_command()
         c = self.config
-        cmd = shlex.split(self._claude) + [
+        cmd = shlex.split(self._cli) + [
             "-p", "--input-format", "stream-json", "--output-format", "stream-json",
             "--verbose", "--include-partial-messages",
             "--model", c.model, "--effort", c.effort, "--name", "jarvis",
@@ -755,6 +822,35 @@ class Brain:
         if c.mcp_config:
             cmd += ["--mcp-config", str(c.mcp_config)]
         cmd += list(c.extra_args)
+        cmd += list(c.cli_args)
+        return cmd
+
+    _HERMES_REASONING = frozenset(
+        {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+
+    def _hermes_command(self) -> list[str]:
+        """One-shot argv for `hermes chat --format stream-json`.
+
+        Hermes has no persistent-stdin protocol like `claude -p
+        --input-format stream-json`: each turn is its own process and the
+        conversation persists via `--resume <session_id>`. The prompt itself
+        travels on stdin (`--query-file -`) so arbitrary text never touches
+        argv. MCP/tools come from hermes's own config — no --tools or
+        --mcp-config flags exist to pass.
+        """
+        c = self.config
+        cmd = shlex.split(self._cli) + [
+            "chat", "--format", "stream-json",
+            "-m", c.model,
+            "--query-file", "-",
+        ]
+        if c.provider:
+            cmd += ["--provider", c.provider]
+        if c.effort in self._HERMES_REASONING:
+            cmd += ["--reasoning", c.effort]
+        if self.session_id:
+            cmd += ["--resume", self.session_id]
+        cmd += list(c.cli_args)
         return cmd
 
     @staticmethod
@@ -773,7 +869,37 @@ class Brain:
         self._failure_reason = None
         self._restart_times = []
         await self._cancel_pending_restart()
+        if self.is_hermes:
+            return await self._start_hermes()
         return await self._spawn()
+
+    async def _start_hermes(self) -> bool:
+        """Hermes warm-up: a single one-shot turn, no persistent process."""
+        self.config.home.mkdir(parents=True, exist_ok=True)
+        self._ready = False
+        self.generation += 1
+        self.context_tokens = 0
+        self.baseline_tokens = 0
+        warm = await self._turn_hermes(WARMUP_TEXT, "system", None,
+                                       timeout=self.config.warmup_timeout,
+                                       warmup=True)
+        if warm.stop_reason != "result" or self._stopping:
+            why = "stopping" if self._stopping else warm.stop_reason
+            if warm.error:
+                why = f"{why}: {warm.error}"
+            log.error(f"brain: hermes warm-up failed ({why})")
+            if not self._stopping:
+                # Like the Claude path's _on_exit → _schedule_restart: one
+                # failed warm-up must not be a permanent death sentence.
+                # There is no persistent process whose exit would schedule
+                # the retry, so do it here, under the same budget.
+                self._schedule_restart(f"hermes warm-up failed ({why})")
+            return False
+        self._ready = True
+        log.info(f"brain ready (hermes): gen={self.generation} model={self.model_in_use} "
+                 f"session={self.session_id} ctx={self.context_tokens}")
+        await self._emit("ready", generation=self.generation, model=self.model_in_use)
+        return True
 
     async def _cancel_pending_restart(self) -> None:
         task = self._restart_task
@@ -938,6 +1064,24 @@ class Brain:
         that started it. If the replacement will not start, the current brain
         keeps serving — a mute JARVIS is worse than a full context window.
         """
+        # Hermes keeps no persistent process: rotation just drops the resumed
+        # session so the next turn starts fresh, carrying the handover note.
+        if self.is_hermes:
+            async with self._turn_lock:
+                if self._stopping or self._failed or not self._ready:
+                    return False
+                if handover:
+                    self._handover = handover
+                    self._handover_untrusted = self._generation_untrusted
+                self._generation_untrusted = None
+                self.session_id = None
+                self.generation += 1
+                self.context_tokens = 0
+                self.baseline_tokens = 0
+                self._rotation_pending = False
+                self._turns_since_pending = 0
+                await self._emit("rotated", generation=self.generation)
+                return True
         # The spawn lock first and the turn lock second, because _spawn() takes
         # them in that order (its warm-up is a turn); the other order would
         # deadlock a rotation against a restart.
@@ -993,7 +1137,7 @@ class Brain:
 
     async def turn(self, text: str, origin: str = "user",
                    on_delta: Optional[DeltaCallback] = None,
-                   on_tool: Optional[Callable[[], None]] = None) -> TurnResult:
+                   on_tool: Optional[Callable[..., None]] = None) -> TurnResult:
         """One user message in, one completed turn out. Turns are serialized."""
         return await self._turn(text, origin, on_delta, timeout=self.config.turn_timeout,
                                 on_tool=on_tool)
@@ -1001,13 +1145,234 @@ class Brain:
     async def _turn(self, text, origin, on_delta, timeout, warmup: bool = False,
                     on_tool=None) -> TurnResult:
         async with self._turn_lock:
-            result = await self._turn_locked(text, origin, on_delta, timeout, warmup,
-                                             on_tool=on_tool)
+            if self.is_hermes:
+                result = await self._turn_hermes(text, origin, on_delta, timeout,
+                                                 warmup=warmup, on_tool=on_tool)
+            else:
+                result = await self._turn_locked(text, origin, on_delta, timeout, warmup,
+                                                 on_tool=on_tool)
         # Deliberately outside the lock: a listener that reacts to
         # `rotation_needed` by rotating would otherwise deadlock against it.
         if not warmup and result.stop_reason == "result":
             await self._note_context()
         return result
+
+    def supersede_turn(self) -> bool:
+        """Kill the in-flight Hermes turn so a newer utterance doesn't queue
+        behind it (sidechat behavior: the latest message wins).
+
+        Only a live USER turn is ever killed — warm-ups and system turns
+        finish on their own. The killed turn ends as `died` through the
+        normal EOF path, freeing `_turn_lock` for the newcomer. No-op (False)
+        on the Claude path, whose persistent process cannot be superseded
+        turn-granularly.
+        """
+        t = self._inflight
+        proc = self._hermes_proc
+        if (t is None or proc is None or t.done.is_set()
+                or t.origin != "user" or proc.returncode is not None):
+            return False
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            return False
+        log.info("brain: superseded in-flight hermes turn for a newer utterance")
+        return True
+
+    async def _turn_hermes(self, text, origin, on_delta, timeout,
+                           warmup: bool = False, on_tool=None) -> TurnResult:
+        """One Hermes turn = one `hermes chat` subprocess.
+
+        Hermes has no persistent-stdin protocol and no system-prompt flag,
+        so conversation continuity comes from `--resume <session_id>`, and
+        the launch prompt rides the FIRST turn's stdin as system context
+        (later turns inherit it through the resumed history).
+
+        A real `_Turn` is held for the subprocess's life so `current_origin`,
+        `turn_untrusted_source` and the taint gate work exactly as on the
+        Claude path. Hermes `tool_use` events feed `t.tools`; web-shaped
+        names taint like their Claude spellings. Residual gap, stated
+        plainly: an unknown Hermes-native tool name is not recognized as
+        foreign text the way `mcp__<server>__*` is.
+        """
+        if self._failed or self._stopping:
+            return TurnResult(origin, "", "not_running")
+        if not self.session_id:
+            # No resumed history yet: this turn carries the persona.
+            text = f"(System context — instructions, not the user's words.)\n{self.launch_prompt()}\n\nUser: {text}"
+        t = _Turn(origin, on_delta, None)
+        t.on_tool = on_tool
+        self._inflight = t
+        started = time.monotonic()
+        first_delta: Optional[float] = None
+        parts: list[str] = []
+        usage: dict = {}
+        error: Optional[str] = None
+        stop_reason = "result"
+        saw_result = False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._hermes_command(), cwd=str(self.config.home),
+                env=self.child_env(),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=claude_env.STREAM_LINE_LIMIT,
+            )
+        except OSError as e:
+            log.error(f"brain: cannot start {self._cli!r}: {e}")
+            if self._inflight is t:
+                self._inflight = None
+            return TurnResult(origin, "", "died", error=str(e))
+        stderr_task = asyncio.create_task(self._drain_hermes_stderr(proc))
+        self._hermes_proc = proc
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(text.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        try:
+            async def _read_all() -> None:
+                nonlocal first_delta, error, stop_reason, usage, saw_result
+                assert proc.stdout is not None
+                while True:
+                    try:
+                        raw = await proc.stdout.readline()
+                    except ValueError as e:
+                        log.warning(f"brain: skipping oversized hermes line ({e})")
+                        continue
+                    if not raw:
+                        break
+                    try:
+                        ev = json.loads(raw.decode(errors="replace"))
+                    except ValueError:
+                        continue
+                    if not isinstance(ev, dict):
+                        continue
+                    kind = ev.get("type")
+                    if kind == "system" and ev.get("subtype") == "init":
+                        if ev.get("session_id"):
+                            self.session_id = ev.get("session_id")
+                        if ev.get("model"):
+                            self.model_in_use = ev.get("model")
+                    elif kind == "tool_use":
+                        name = str(ev.get("name") or "")
+                        if name:
+                            t.tools.append(name)
+                            if t.on_tool:
+                                try:
+                                    t.on_tool(name)
+                                except Exception as e:
+                                    log.warning(f"tool listener failed: {e}")
+                    elif kind == "text":
+                        # Streaming delta (hermes emits one `text` event per
+                        # fragment). Spoken as it arrives, like the claude
+                        # path's content_block_delta.
+                        frag = ev.get("text")
+                        if isinstance(frag, str) and frag:
+                            if first_delta is None:
+                                first_delta = time.monotonic() - started
+                                t.first_delta = first_delta
+                            parts.append(frag)
+                            t.parts.append(frag)
+                            if on_delta:
+                                try:
+                                    on_delta(frag)
+                                except Exception as e:
+                                    log.warning(f"delta listener failed: {e}")
+                    elif kind == "result":
+                        saw_result = True
+                        txt = ev.get("text")
+                        # The result repeats the streamed deltas verbatim;
+                        # take it only when nothing streamed (error paths).
+                        if not parts and isinstance(txt, str) and txt:
+                            parts.append(txt)
+                        toks = ev.get("tokens")
+                        if isinstance(toks, dict):
+                            try:
+                                usage = {
+                                    "input_tokens": int(toks.get("input") or 0),
+                                    "output_tokens": int(toks.get("output") or 0),
+                                }
+                            except (TypeError, ValueError):
+                                usage = {}
+                        err = ev.get("error")
+                        code = ev.get("exit_code")
+                        if err or (isinstance(code, int) and code != 0):
+                            error = str(err or f"hermes exited with {code}")
+                            log.error(f"brain: hermes turn failed: {error[:300]}")
+                            stop_reason = "error"
+                        break
+            await asyncio.wait_for(_read_all(), timeout=timeout)
+        except asyncio.TimeoutError:
+            stop_reason = "timeout"
+            log.error(f"brain: hermes turn stuck for {timeout}s")
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), 5.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+        finally:
+            if not stderr_task.done():
+                stderr_task.cancel()
+            if self._hermes_proc is proc:
+                self._hermes_proc = None
+        body = "".join(parts)
+        if not saw_result and stop_reason == "result":
+            # The child ended (or was killed) without ever emitting a
+            # result: a silent crash, not an empty success. The fixture
+            # taught this the hard way — a stand-in dying on startup read
+            # as a successful turn with no text.
+            stop_reason = "died"
+            error = error or "hermes ended with no result event"
+        if body and not t.parts:
+            # Nothing streamed (older hermes shape): the whole result is the turn.
+            t.parts.append(body)
+        if on_delta and body and first_delta is None:
+            # Nothing streamed (older hermes shape): deliver whole.
+            try:
+                on_delta(body)
+            except Exception as e:
+                log.warning(f"delta listener failed: {e}")
+            first_delta = time.monotonic() - started
+            t.first_delta = first_delta
+        # Hermes reports only this turn's tokens, not the window: accumulate
+        # so the rotation budget still sees growth. The warm-up turn instead
+        # sets the resident floor, exactly like the claude path.
+        ctx = usage.get("input_tokens", 0)
+        if warmup:
+            self.context_tokens = ctx
+            self.baseline_tokens = ctx
+        else:
+            self.context_tokens = self.context_tokens + ctx
+        ctx_for_result = self.context_tokens
+        t.usage = usage
+        if stop_reason == "timeout":
+            t.finish("timeout")
+        elif stop_reason == "error":
+            t.finish("error")
+            t.error = error
+        elif stop_reason == "died":
+            t.finish("died")
+            t.error = error
+        else:
+            t.finish("result")
+        try:
+            return t.result(self.rate_limit)
+        finally:
+            # Same contract as _turn_locked: the taint folds into the
+            # generation before _inflight is cleared.
+            if self._inflight is t:
+                self._note_generation_taint()
+                self._inflight = None
 
     async def _turn_locked(self, text, origin, on_delta, timeout,
                            warmup: bool = False, on_tool=None) -> TurnResult:
@@ -1146,7 +1511,7 @@ class Brain:
                     # spoken; see server.py's `_HoldFirstLine`.
                     if t.on_tool:
                         try:
-                            t.on_tool()
+                            t.on_tool(str(block.get("name")))
                         except Exception as e:
                             log.warning(f"tool listener failed: {e}")
                 elif block.get("type") == "text" and block.get("text"):
@@ -1198,6 +1563,20 @@ class Brain:
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+
+    async def _drain_hermes_stderr(self, proc: asyncio.subprocess.Process) -> None:
+        """Keep a one-shot child's stderr pipe empty (a plugin/MCP warning
+        burst filling the 64K buffer would otherwise wedge the turn until
+        its timeout). Output is discarded: the JSONL result on stdout is
+        the record, and stderr text here is engine chatter, not content."""
+        try:
+            assert proc.stderr is not None
+            while True:
+                chunk = await proc.stderr.read(4096)
+                if not chunk:
+                    return
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def _drain_stderr(self, proc: asyncio.subprocess.Process) -> None:
         assert proc.stderr is not None
@@ -1264,7 +1643,10 @@ class Brain:
                 await asyncio.sleep(backoff)
                 if self._stopping or self.ready:
                     return              # stopped, or an explicit start() already won
-                if await self._spawn():
+                if self.is_hermes:
+                    if await self._start_hermes():
+                        return
+                elif await self._spawn():
                     return
                 reason = "start failed"
         except asyncio.CancelledError:

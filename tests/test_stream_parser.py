@@ -203,3 +203,22 @@ def test_the_cap_is_documented_and_sane():
     # permanent database.
     assert 64 * 1024 <= stream_parser.PAYLOAD_MAX_CHARS <= 1024 * 1024
     assert stream_parser.PAYLOAD_STRING_MAX < stream_parser.PAYLOAD_MAX_CHARS
+
+
+def test_extract_result_metrics_reads_hermes_shape():
+    import stream_parser
+    ev = {"type": "result", "session_id": "s1", "exit_code": 0,
+          "text": "hello there",
+          "tokens": {"input": 10, "output": 4, "total": 14}}
+    m = stream_parser.extract_result_metrics(ev)
+    assert m["result_text"] == "hello there"
+    assert m["input_tokens"] == 10 and m["output_tokens"] == 4
+    assert m["is_error"] is False
+
+
+def test_extract_result_metrics_flags_hermes_error():
+    import stream_parser
+    ev = {"type": "result", "exit_code": 1, "text": "",
+          "error": "HTTP 401: Invalid API key"}
+    m = stream_parser.extract_result_metrics(ev)
+    assert m["is_error"] is True

@@ -11,12 +11,15 @@
 
 interface StatusResponse {
   claude_code_installed: boolean;
+  cli_backend?: string;
   server_port: number;
   uptime_seconds: number;
   env_keys_set: {
     fish_audio: boolean;
     fish_voice_id: boolean;
+    edge_tts?: boolean;
     user_name: string;
+    preferred_lang?: string;
   };
 }
 
@@ -32,7 +35,7 @@ interface PreferencesResponse {
 let panelEl: HTMLElement | null = null;
 let isOpen = false;
 let isFirstTimeSetup = false;
-let setupStep = 0; // 0=fish, 1=name, 2=done
+let setupStep = 0; // 0=name, 1=done (Edge TTS needs no key)
 
 // ---------------------------------------------------------------------------
 // API helpers
@@ -71,40 +74,23 @@ function buildPanelHTML(): string {
 
       <div class="settings-body">
 
-        <!-- API Keys -->
-        <section class="settings-section" id="section-api-keys">
-          <h3>API Keys</h3>
+        <!-- Voice -->
+        <section class="settings-section" id="section-voice">
+          <h3>Voice (Edge TTS — no key needed)</h3>
 
           <div class="settings-field">
-            <label>Fish Audio API Key</label>
             <div class="settings-input-row">
-              <input type="password" id="input-fish-key" placeholder="Fish Audio key..." />
-              <button class="settings-btn" id="btn-test-fish">Test</button>
-              <span class="status-dot" id="status-fish"></span>
+              <button class="settings-btn" id="btn-test-edge-tts">Test voice</button>
+              <span class="status-dot" id="status-edge-tts"></span>
             </div>
           </div>
-
-          <div class="settings-field">
-            <label>Fish Voice ID</label>
-            <div class="settings-input-row">
-              <input type="text" id="input-fish-voice-id" placeholder="612b878b113047d9a770c069c8b4fdfe" />
-              <button class="settings-btn" id="btn-save-voice-id">Save</button>
-            </div>
-          </div>
-
-          <div class="settings-actions">
-            <button class="settings-btn primary" id="btn-save-keys">Save Keys</button>
-          </div>
-          <p class="settings-restart-notice" id="keys-restart-notice" style="display:none">
-            Saved. Restart the server (menu &rarr; Restart Server) for this to take effect.
-          </p>
         </section>
 
         <!-- Connection Status -->
         <section class="settings-section" id="section-status">
           <h3>Connection Status</h3>
           <div class="status-grid">
-            <div class="status-row"><span class="status-dot" id="status-claude-cli"></span><span>Claude Code CLI</span></div>
+            <div class="status-row"><span class="status-dot" id="status-claude-cli"></span><span>Agent CLI</span></div>
             <div class="status-row"><span class="status-dot" id="status-server"></span><span>Server</span><span class="status-detail" id="status-server-detail"></span></div>
           </div>
         </section>
@@ -188,8 +174,8 @@ async function loadStatus() {
     const serverDetail = document.getElementById("status-server-detail");
     if (serverDetail) serverDetail.textContent = `port ${status.server_port} | up ${formatUptime(status.uptime_seconds)}`;
 
-    // API key status dots
-    setDotStatus("status-fish", status.env_keys_set.fish_audio ? "green" : "red");
+    // Voice status dot (Edge TTS: installed = green, missing = red)
+    setDotStatus("status-edge-tts", status.env_keys_set.edge_tts ?? true ? "green" : "red");
 
     // System info
     const portEl = document.getElementById("sysinfo-port");
@@ -200,13 +186,13 @@ async function loadStatus() {
     return status;
   } catch (e) {
     console.error("[settings] failed to load status:", e);
-    // EVERY dot, not just the server's. The CLI and Fish dots are drawn from
+    // EVERY dot, not just the server's. The CLI and voice dots are drawn from
     // fields of the answer that never arrived, so leaving them green states
     // as fact something this call failed to find out. "off" is the absence
     // of a reading, which is what we have.
     setDotStatus("status-server", "red");
     setDotStatus("status-claude-cli", "off");
-    setDotStatus("status-fish", "off");
+    setDotStatus("status-edge-tts", "off");
     const serverDetail = document.getElementById("status-server-detail");
     if (serverDetail) serverDetail.textContent = "no answer from the server";
     for (const id of ["sysinfo-port", "sysinfo-uptime"]) {
@@ -234,38 +220,14 @@ function wireEvents() {
   document.getElementById("settings-close")?.addEventListener("click", closeSettings);
   document.getElementById("settings-backdrop")?.addEventListener("click", closeSettings);
 
-  // Save keys
-  document.getElementById("btn-save-keys")?.addEventListener("click", async () => {
-    const fishKey = (document.getElementById("input-fish-key") as HTMLInputElement).value.trim();
-
-    let savedAny = false;
-    if (fishKey) {
-      await apiPost("/api/settings/keys", { key_name: "FISH_API_KEY", key_value: fishKey });
-      savedAny = true;
-    }
-    await loadStatus();
-
-    const notice = document.getElementById("keys-restart-notice");
-    if (notice) notice.style.display = savedAny ? "block" : "none";
-  });
-
-  // Save voice ID
-  document.getElementById("btn-save-voice-id")?.addEventListener("click", async () => {
-    const voiceId = (document.getElementById("input-fish-voice-id") as HTMLInputElement).value.trim();
-    if (voiceId) {
-      await apiPost("/api/settings/keys", { key_name: "FISH_VOICE_ID", key_value: voiceId });
-    }
-  });
-
-  // Test Fish
-  document.getElementById("btn-test-fish")?.addEventListener("click", async () => {
-    setDotStatus("status-fish", "yellow");
-    const key = (document.getElementById("input-fish-key") as HTMLInputElement).value.trim();
+  // Test Edge TTS voice
+  document.getElementById("btn-test-edge-tts")?.addEventListener("click", async () => {
+    setDotStatus("status-edge-tts", "yellow");
     try {
-      const result = await apiPost<{ valid: boolean; error?: string }>("/api/settings/test-fish", { key_value: key || undefined });
-      setDotStatus("status-fish", result.valid ? "green" : "red");
+      const result = await apiPost<{ valid: boolean; error?: string }>("/api/settings/test-edge-tts", {});
+      setDotStatus("status-edge-tts", result.valid ? "green" : "red");
     } catch {
-      setDotStatus("status-fish", "red");
+      setDotStatus("status-edge-tts", "red");
     }
   });
 
@@ -295,31 +257,29 @@ function enterSetupMode() {
   const nav = document.getElementById("setup-nav");
   if (nav) nav.style.display = "flex";
 
-  // Hide sections except API keys
+  // Hide sections except preferences
   showSetupStep(0);
 }
 
 function showSetupStep(step: number) {
-  const sections = ["section-api-keys", "section-preferences"];
+  const sections = ["section-preferences"];
   sections.forEach((id, i) => {
     const el = document.getElementById(id);
     if (!el) return;
     if (step === 0 && i === 0) el.style.display = "";
-    else if (step === 1 && i === 1) el.style.display = "";
     else el.style.display = "none";
   });
 
   const nextBtn = document.getElementById("btn-setup-next");
   if (nextBtn) {
-    if (step === 0) nextBtn.textContent = "Next: Set Your Name";
-    else if (step === 1) nextBtn.textContent = "Finish Setup";
+    if (step === 0) nextBtn.textContent = "Finish Setup";
     else nextBtn.style.display = "none";
   }
 }
 
 async function advanceSetup() {
   setupStep++;
-  if (setupStep >= 2) {
+  if (setupStep >= 1) {
     // Done — save everything and close
     isFirstTimeSetup = false;
     const welcome = document.getElementById("settings-welcome");
@@ -328,7 +288,7 @@ async function advanceSetup() {
     if (nav) nav.style.display = "none";
 
     // Show all sections
-    ["section-api-keys", "section-status", "section-preferences", "section-sysinfo"].forEach((id) => {
+    ["section-voice", "section-status", "section-preferences", "section-sysinfo"].forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.style.display = "";
     });
@@ -363,8 +323,8 @@ export async function openSettings() {
   const status = await loadStatus();
   await loadPreferences();
 
-  // Check for first-time setup
-  if (status && !status.env_keys_set.fish_audio) {
+  // Check for first-time setup (no name set yet)
+  if (status && !status.env_keys_set.user_name) {
     enterSetupMode();
   }
 }
@@ -388,7 +348,15 @@ export function isSettingsOpen(): boolean {
 export async function checkFirstTimeSetup(): Promise<boolean> {
   try {
     const status = await apiGet<StatusResponse>("/api/settings/status");
-    if (!status.env_keys_set.fish_audio) {
+    // Adopt JARVIS's learned default on a browser with no choice yet.
+    const stored = localStorage.getItem("jarvis-lang");
+    const suggested = (status.env_keys_set.preferred_lang || "en").toUpperCase();
+    if (!stored && (suggested === "ID" || suggested === "ZH")) {
+      localStorage.setItem("jarvis-lang", suggested);
+      window.location.reload();
+      return true;
+    }
+    if (!status.env_keys_set.user_name) {
       openSettings();
       return true;
     }

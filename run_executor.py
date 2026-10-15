@@ -18,6 +18,7 @@ import os
 import shlex
 import shutil
 import time
+from pathlib import Path
 from typing import Callable
 
 import claude_env
@@ -207,7 +208,12 @@ class RunExecutor:
                  idle_sec: float | None = None,
                  poll_sec: float = _READ_POLL_SEC):
         self._store = store
-        self._claude_path = claude_path or shutil.which("claude") or "claude"
+        self._claude_path = (
+            claude_path
+            or os.getenv("JARVIS_CLI_PATH")
+            or shutil.which("claude")
+            or "claude"
+        )
         self._max_concurrent = max_concurrent
         self._grace_sec = grace_sec
         self._eof_grace_sec = eof_grace_sec
@@ -441,6 +447,8 @@ class RunExecutor:
 
     def _command(self, run_id: str, resume_from: str | None,
                 model: str | None = None) -> list[str]:
+        if "hermes" in Path(shlex.split(self._claude_path)[0]).stem:
+            return self._hermes_command(run_id, resume_from, model)
         base = shlex.split(self._claude_path)
         cmd = base + ["-p", "--output-format", "stream-json", "--verbose",
                       "--session-id", run_id]
@@ -456,6 +464,29 @@ class RunExecutor:
             # Matches the five existing call sites. Without this a run blocks on
             # a permission prompt it has no TTY to answer, and hangs forever.
             cmd.append("--dangerously-skip-permissions")
+        return cmd
+
+    def _hermes_command(self, run_id: str, resume_from: str | None,
+                        model: str | None = None) -> list[str]:
+        """One-shot `hermes chat` argv. The prompt travels on stdin
+        (`--query-file -`), like the claude path, so `_drive` is unchanged.
+        Each run is a fresh Hermes session; a retry resumes the failed one."""
+        resolved = self._resolve_model(model)
+        if resolved == _DEFAULT_MODEL:
+            resolved = os.getenv("JARVIS_RUN_MODEL") or "kgw/kilo-auto/free"
+        cmd = shlex.split(self._claude_path) + [
+            "chat", "--format", "stream-json",
+            "-m", resolved,
+            "--query-file", "-",
+        ]
+        provider = os.getenv("JARVIS_HERMES_PROVIDER")
+        if provider:
+            cmd += ["--provider", provider]
+        if resume_from:
+            cmd += ["--resume", resume_from]
+        extra = os.getenv("JARVIS_CLI_EXTRA_ARGS", "")
+        if extra:
+            cmd += extra.split()
         return cmd
 
     async def _publish_run_updated(self, run_id: str) -> None:
@@ -597,7 +628,7 @@ class RunExecutor:
                 )
             except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
                 await self._finish(run_id, self._store.RunStatus.FAILED,
-                                   error=f"could not start claude: {e}")
+                                   error=f"could not start CLI: {e}")
                 return
 
             self._procs[run_id] = proc
@@ -647,7 +678,7 @@ class RunExecutor:
                 # TIMED_OUT rather than FAILED: it used up a time budget,
                 # which is what a timeout is. The budget it used up is named
                 # in the error so the two are never confused in the UI.
-                error = (f"claude produced no output for {self._idle_sec}s "
+                error = (f"CLI produced no output for {self._idle_sec}s "
                          f"and was still running; killed")
                 if stderr:
                     error = f"{error}\n{stderr}"
@@ -691,7 +722,7 @@ class RunExecutor:
                 # and we killed it, so its exit status says nothing. FAILED
                 # rather than TIMED_OUT: it did not use up a time budget, it
                 # refused to exit.
-                error = (f"claude closed stdout but did not exit within "
+                error = (f"CLI closed stdout but did not exit within "
                          f"{self._eof_grace_sec}s; killed")
                 if stderr:
                     error = f"{error}\n{stderr}"
@@ -706,7 +737,7 @@ class RunExecutor:
                 # run that wrote files and then errored looks like work done.
                 # A run whose own final event says it errored is FAILED.
                 error = (run["result_text"] or stderr
-                         or "claude reported is_error on its result event")
+                         or "CLI reported is_error on its result event")
                 await self._finish(run_id, self._store.RunStatus.FAILED,
                                    exit_code=0, error=error[:_STDERR_CHARS])
             elif proc.returncode == 0:

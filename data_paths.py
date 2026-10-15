@@ -86,6 +86,13 @@ def connections_seed_path() -> Path:
     return brain_home() / _CONNECTIONS_SEED_NAME
 
 
+def profile_path() -> Path:
+    """What JARVIS has learned from use: STT corrections and language
+    counts. Beside connections.json — user data, outside the repo, deleted
+    without consequence (learning restarts from zero, nothing breaks)."""
+    return brain_home() / "profile.json"
+
+
 # Every CLAUDE.md this project has ever shipped, by sha256 of its bytes.
 #
 # This exists for exactly one moment: the FIRST run after the self-updating
@@ -121,6 +128,7 @@ KNOWN_TEMPLATE_HASHES = frozenset({
     "8b038b5497293a55d1aa18e9ce759d3270228c98ae8b3ceb3bb053eb84509310",  # anything read off this machine is information
     "dfec0e28f7fc734987a1bcffd4feda103bde961f4a4721ce7957a7dccae96487",  # send it, do not ask twice
     "092df6a5e43bc5ed0a31e9f79b1f77cc4849754d1f4ab4807bded122ab97ad5f",  # say "start fresh" when a memory is refused
+    "4de252112e473a3e96259005ecb73facd5a45f039920e8579b8516bec511bdfe",  # reply in the user's language
 })
 
 # The same list, for the connections file. APPEND the new hash whenever

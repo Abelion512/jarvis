@@ -11,19 +11,20 @@ by hitting them live, and this walkthrough assumes them.
 
 When a user clones this repo and starts Claude Code, help them:
 1. Copy .env.example to .env
-2. Install Claude Code (`npm install -g @anthropic-ai/claude-code`, 2.1.224 or
-   newer) and log in with `claude` — JARVIS's brain runs on your Claude
-   subscription, not on an API key
-3. Get a Fish Audio API key from fish.audio (required — there is no fallback
-   voice)
+2. Install an agent CLI: Claude Code (`npm install -g @anthropic-ai/claude-code`, 2.1.224 or
+   newer) and log in with `claude` — or Hermes Agent (`JARVIS_CLI_PATH=hermes`,
+   default model `kgw/kilo-auto/free`). JARVIS's brain runs on your
+   subscription/login, not on an API key
+3. No TTS key needed — JARVIS speaks through Edge TTS (the `edge-tts`
+   package in requirements.txt)
 4. Install Python dependencies: pip install -r requirements.txt
 5. Install the Playwright browser: python -m playwright install chromium
    (`read_page` / `look_at_page` need it)
-6. Install frontend dependencies: cd frontend && npm install
+6. Install frontend dependencies: cd frontend && bun install
 7. Generate the SSL certs — see below, they are NOT optional:
    `openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'`
 8. Run the backend: python server.py --host 127.0.0.1
-9. Run the frontend: cd frontend && npm run dev
+9. Run the frontend: cd frontend && bun run dev
 10. Open Chrome (mic only works in Chrome) to http://localhost:5173
 11. Click to enable audio, speak to JARVIS
 
@@ -40,9 +41,10 @@ this presents as "the UI is up but nothing works" rather than as an error.
 - **Backend**: FastAPI + Python (server.py, ~5800 lines)
 - **Frontend**: Vite + TypeScript + Three.js (audio-reactive orb)
 - **Communication**: WebSocket (JSON messages + binary audio)
-- **AI**: a long-lived Claude Code process (`brain.py`, Sonnet by default) on
-  the user's subscription; no Anthropic API calls on the voice path
-- **TTS**: Fish Audio with JARVIS voice model
+- **AI**: a long-lived agent-CLI process (`brain.py`, Sonnet by default on
+  Claude Code, `kgw/kilo-auto/free` on Hermes) on the user's subscription;
+  no Anthropic API calls on the voice path
+- **TTS**: Edge TTS (Microsoft, no key) with JARVIS voice mapping
 - **System**: AppleScript for Terminal and Chrome integration
 - **Runs**: every Claude Code execution goes through one recorded pipeline —
   `run_store.py` (SQLite) + `run_executor.py`, surfaced at `/api/runs`,
@@ -75,26 +77,30 @@ Nothing spawns Claude Code outside `RunExecutor`. Two invariants govern it:
    WebSocket is a cache-invalidation hint, never a source of truth; clients
    reconcile against `/api/runs`.
 
-Two more rules for this area: no new npm or Python dependencies, and the
+Two more rules for this area: no new bun or Python dependencies, and the
 dashboard never uses `innerHTML` / `insertAdjacentHTML` — it renders
 arbitrary LLM and file content, so everything goes through
 `createElement` / `textContent`.
 
 ## Key Files
 - `server.py` — Main server, WebSocket handler, HTTP API, action system
-- `brain.py` — The voice brain: one long-lived `claude -p` process on the
-  user's Claude subscription, fed over stdin as stream-json
+- `brain.py` — The voice brain: one long-lived agent-CLI session on the
+  user's subscription (`claude -p` persistent process, or per-turn
+  `hermes chat --resume` when `JARVIS_CLI_PATH` names Hermes; the Hermes
+  backend is voice-chat only — JARVIS MCP tools and session watching stay
+  on the Claude Code path until Hermes MCP wiring lands)
 - `jarvis_mcp.py` — Stdio MCP server exposing JARVIS's tools to the brain;
   forwards `tools/call` to `POST /internal/tool`
 - `speech.py` — Sentence splitting and the scheduler that owns every
   utterance JARVIS speaks
-- `tts.py` — Fish Audio synthesis, one request per sentence chunk
+- `tts.py` — Edge TTS synthesis, one request per sentence chunk
 - `frontend/src/orb.ts` — Three.js particle orb visualization
 - `frontend/src/voice.ts` — Web Speech API + audio playback
 - `frontend/src/main.ts` — Frontend state machine
 - `frontend/src/dashboard/` — The `/dashboard` run monitor (vanilla TS)
 - `run_store.py` — SQLite `runs` / `run_events` tables, six-value status enum
-- `run_executor.py` — Spawns `claude -p --output-format stream-json` and drives
+- `run_executor.py` — Spawns one-shot agent runs (`claude -p
+  --output-format stream-json`, or `hermes chat --format stream-json`) and drives
   each run to a terminal state, streaming its events into the store
 - `stream_parser.py` — Pure parsing of the stream-json output (no I/O)
 - `builds.py` — The spec/brief/plan pipeline behind real, phased,
@@ -114,8 +120,8 @@ arbitrary LLM and file content, so everything goes through
   user can read and edit directly, not a database
 - `usage_store.py` — Tracks the subscription's five-hour / seven-day
   rate-limit usage (there is no spend to report — see brain.py)
-- `preflight.py` — First-run environment checks: `claude` CLI/login,
-  Accessibility, Fish key, cross-session steering
+- `preflight.py` — First-run environment checks: agent CLI/login,
+  Accessibility, Edge TTS install, cross-session steering
 - `claude_env.py` — The environment every spawned Claude Code child gets,
   including the `ANTHROPIC_*` scrub
 - `actions.py` — System actions (Terminal, Chrome) via AppleScript
@@ -154,14 +160,19 @@ JARVIS builds**. It is only this repository's own copies that are gone.
   never bill an API key instead, and `preflight.py`'s `anthropic_key_leftover`
   check warns you if one is sitting in your `.env` — that is the only place
   the name appears in live code.
-- `JARVIS_BRAIN_MODEL` (optional, default `sonnet`) — model for the brain,
-  always passed explicitly as `--model`
+- `JARVIS_BRAIN_MODEL` (optional, default `sonnet` on Claude Code,
+  `kgw/kilo-auto/free` on Hermes) — model for the brain,
+  always passed explicitly as `--model` / `-m`
 - `JARVIS_BRAIN_AUTOSTART` (optional, default `1`) — `0` builds the brain but
   never spawns it (every test sets this)
+- `JARVIS_CLI_PATH` (optional, default `claude`) — agent CLI binary the
+  brain and runs spawn; set to `hermes` for Hermes Agent.
+  `JARVIS_CLAUDE_PATH` is still honoured as a legacy alias
+- `JARVIS_CLI_EXTRA_ARGS` (optional) — extra argv appended to every
+  brain/run spawn
+- `JARVIS_HERMES_PROVIDER` (optional) — Hermes `--provider` override
 - `JARVIS_MUTE_MIC_DURING_SPEECH` (optional, default false) — fallback if echo
   rejection is not enough with a given microphone
-- `FISH_API_KEY` (required) — Fish Audio TTS
-- `FISH_VOICE_ID` (optional) — Voice model ID
 - `USER_NAME` (optional) — Your name for JARVIS to use
 - `JARVIS_DATA_DIR` (optional) — Where JARVIS writes everything: the SQLite
   database, memory Markdown, usage.json, the tool token. Defaults to `data/`

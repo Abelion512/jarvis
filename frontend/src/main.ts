@@ -6,7 +6,7 @@
  */
 
 import { createOrb, type OrbState } from "./orb";
-import { createVoiceInput, createAudioPlayer, createMicMonitor } from "./voice";
+import { createVoiceInput, createAudioPlayer, createMicMonitor, createPCMInput } from "./voice";
 import { createSocket } from "./ws";
 import { openSettings, checkFirstTimeSetup } from "./settings";
 import "./style.css";
@@ -77,11 +77,20 @@ function transition(newState: State) {
 // Voice input
 // ---------------------------------------------------------------------------
 
+// Spoken-language selector: EN → ID → ZH. Decides both the recogniser tag
+// (en-US/id-ID/zh-CN) and the voice the reply is synthesised with.
+const SPOKEN_TAGS = ["en-US", "id-ID", "zh-CN"] as const;
+const SPOKEN_CODES = ["EN", "ID", "ZH"] as const;
+const storedLang = localStorage.getItem("jarvis-lang");
+let spokenIdx = Math.max(0, SPOKEN_CODES.indexOf(
+  storedLang === "ID" || storedLang === "ZH" ? storedLang : "EN"));
+let spokenLang: "en" | "id" | "zh" = SPOKEN_CODES[spokenIdx].toLowerCase() as "en" | "id" | "zh";
+
 const voiceInput = createVoiceInput(
   (text: string) => {
     // The server decides whether this is echo, a barge-in, or a new turn.
     micMonitor.sawSpeech();
-    socket.send({ type: "transcript", text, isFinal: true });
+    socket.send({ type: "transcript", text, isFinal: true, lang: spokenLang });
   },
   (text: string) => {
     micMonitor.sawSpeech();
@@ -145,6 +154,13 @@ function hush() {
 hushBtn.addEventListener("click", hush);
 window.addEventListener("keydown", (e: KeyboardEvent) => {
   if (e.key === "Escape") { e.preventDefault(); hush(); }
+  // 1/2/3 switches recognition language without reaching for the mouse.
+  // Ignored while typing in a field, so setting your name never flips it.
+  const target = document.activeElement;
+  const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement;
+  if (!typing && (e.key === "1" || e.key === "2" || e.key === "3")) {
+    setSpokenLang(Number(e.key) - 1);
+  }
 });
 
 audioPlayer.onPlayed((utt, idx) => {
@@ -190,6 +206,22 @@ socket.onMessage((msg) => {
     // A chunk TTS could not voice: show it instead of losing it
     console.log("[JARVIS]", msg.text);
     statusEl.textContent = String(msg.text);
+  } else if (type === "live_audio") {
+    // Gemini Live reply: base64 16-bit PCM 24kHz mono → speaker.
+    const b64 = String(msg.data ?? "");
+    if (b64) {
+      try {
+        const bin = atob(b64);
+        const pcm = new Int16Array(bin.length / 2);
+        for (let i = 0; i < pcm.length; i++) {
+          pcm[i] = (bin.charCodeAt(i * 2) & 0xff) | (bin.charCodeAt(i * 2 + 1) << 8);
+        }
+        if (currentState !== "speaking") transition("speaking");
+        audioPlayer.playPCM(pcm);
+      } catch (err) {
+        console.error("[audio] live chunk unplayable:", err);
+      }
+    }
   } else if (type === "notice") {
     // Shown, never spoken. The server sends one when it is about to be busy
     // for a few seconds (a context rotation), and an empty string to clear it.
@@ -208,6 +240,15 @@ socket.onMessage((msg) => {
 setTimeout(() => {
   voiceInput.start();
   if (currentState !== "speaking") transition("listening");
+  // Live-session PCM path, opt-in only: ?stt=gemini streams mic PCM over the
+  // same socket (server routes bytes to Gemini when JARVIS_STT_PROVIDER=gemini).
+  // Default path unchanged.
+  try {
+    if (new URLSearchParams(window.location.search).get("stt") === "gemini") {
+      const pcm = createPCMInput((chunk) => socket.sendBytes(chunk));
+      pcm.start().catch((e) => showError(`Live mic failed: ${e}`));
+    }
+  } catch { /* query parse never blocks voice */ }
 }, 1000);
 
 // Resume AudioContext on ANY user interaction (browser autoplay policy)
@@ -250,6 +291,28 @@ btnMute.addEventListener("click", (e) => {
 btnMenu.addEventListener("click", (e) => {
   e.stopPropagation();
   menuDropdown.style.display = menuDropdown.style.display === "none" ? "block" : "none";
+});
+
+// Spoken-language button: EN → ID → ZH. Applies to the recogniser (next
+// rotation) and tags every transcript so the reply is synthesised with the
+// matching Edge voice. Persisted across reloads.
+const btnLang = document.createElement("button");
+btnLang.id = "btn-lang";
+btnLang.type = "button";
+btnLang.title = "Recognition language (EN/ID/ZH)";
+btnLang.textContent = SPOKEN_CODES[spokenIdx];
+document.body.appendChild(btnLang);
+voiceInput.setLanguage(SPOKEN_TAGS[spokenIdx]);
+function setSpokenLang(idx: number) {
+  spokenIdx = ((idx % SPOKEN_CODES.length) + SPOKEN_CODES.length) % SPOKEN_CODES.length;
+  spokenLang = (["en", "id", "zh"] as const)[spokenIdx];
+  localStorage.setItem("jarvis-lang", SPOKEN_CODES[spokenIdx]);
+  btnLang.textContent = SPOKEN_CODES[spokenIdx];
+  voiceInput.setLanguage(SPOKEN_TAGS[spokenIdx]);
+}
+btnLang.addEventListener("click", (e) => {
+  e.stopPropagation();
+  setSpokenLang(spokenIdx + 1);
 });
 
 document.addEventListener("click", () => {

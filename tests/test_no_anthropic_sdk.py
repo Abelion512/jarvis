@@ -149,17 +149,23 @@ def test_settings_keys_rejects_unknown_name(client):
 
 def test_settings_keys_still_accepts_the_keys_jarvis_actually_uses(client):
     c, server = client
-    for name, value in (("FISH_API_KEY", "fish-abc"),
-                        ("FISH_VOICE_ID", "voice-abc"),
-                        ("USER_NAME", "Tony"),
+    for name, value in (("USER_NAME", "Tony"),
                         ("HONORIFIC", "sir")):
         r = c.post("/api/settings/keys",
                    json={"key_name": name, "key_value": value})
         assert r.status_code == 200, name
         assert r.json()["success"] is True
     _, parsed = server._read_env()
-    assert parsed["FISH_API_KEY"] == "fish-abc"
     assert parsed["USER_NAME"] == "Tony"
+
+
+def test_settings_keys_rejects_retired_fish_keys(client):
+    """Fish Audio is retired: the settings door no longer accepts its keys."""
+    c, _ = client
+    for name in ("FISH_API_KEY", "FISH_VOICE_ID"):
+        r = c.post("/api/settings/keys",
+                   json={"key_name": name, "key_value": "x"})
+        assert r.status_code == 400, name
 
 
 def test_settings_status_does_not_report_a_workspace_id(client):

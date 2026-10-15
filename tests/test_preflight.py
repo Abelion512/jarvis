@@ -381,17 +381,28 @@ def test_the_startup_check_never_takes_a_picture(monkeypatch):
     assert preflight._check_screen_recording_sync().status == STATUS_OK
 
 
-# --- FISH_API_KEY -------------------------------------------------------------
+# --- Edge TTS -------------------------------------------------------------
 
-def test_fish_api_key_present(monkeypatch):
-    monkeypatch.setenv("FISH_API_KEY", "sk-fish-abc123")
-    check = preflight._check_fish_api_key_sync()
+def test_edge_tts_available_when_package_installed(monkeypatch):
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "edge_tts", types.ModuleType("edge_tts"))
+    check = preflight._check_edge_tts_connectivity_sync()
     assert check.status == STATUS_OK
+    assert check.remedy is None
 
 
-def test_fish_api_key_absent(monkeypatch):
-    monkeypatch.delenv("FISH_API_KEY", raising=False)
-    check = preflight._check_fish_api_key_sync()
+def test_edge_tts_missing_is_fail_with_install_remedy(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "edge_tts":
+            raise ImportError("No module named 'edge_tts'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    check = preflight._check_edge_tts_connectivity_sync()
     assert check.status == STATUS_FAIL
     assert check.remedy
 
@@ -480,6 +491,7 @@ async def test_a_hung_check_times_out_as_warn(monkeypatch):
 
     monkeypatch.setattr(preflight, "_ASYNC_CHECKS", (hang,))
     monkeypatch.setattr(preflight, "_SYNC_CHECKS", ())
+    monkeypatch.setattr(preflight, "_REACHABILITY_CHECKS", ())
 
     results = await preflight.run_checks(timeout=0.05)
     assert len(results) == 1
@@ -494,6 +506,7 @@ async def test_a_raising_check_becomes_warn_not_an_exception(monkeypatch):
 
     monkeypatch.setattr(preflight, "_ASYNC_CHECKS", ())
     monkeypatch.setattr(preflight, "_SYNC_CHECKS", (explode,))
+    monkeypatch.setattr(preflight, "_REACHABILITY_CHECKS", ())
 
     results = await preflight.run_checks(timeout=1.0)
     assert len(results) == 1
@@ -514,16 +527,19 @@ async def test_run_checks_never_raises_even_with_a_broken_check(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_checks_runs_all_registered_checks(monkeypatch):
-    monkeypatch.setattr(preflight.shutil, "which", lambda name: None)  # claude missing -> fast fail
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: None)  # CLI missing -> fast fail
     monkeypatch.setattr(preflight.sys, "platform", "linux")  # accessibility skipped -> fast warn
-    monkeypatch.delenv("FISH_API_KEY", raising=False)
     monkeypatch.setattr(preflight, "_settings_path", lambda: preflight.Path("/nonexistent/settings.json"))
 
-    results = await preflight.run_checks(timeout=1.0)
+    # Generous timeout: this asserts the SET of checks, and a slow first
+    # import under load must not surface as a wrong name (a timed-out check
+    # reports its function name, not its check name).
+    results = await preflight.run_checks(timeout=10.0)
     names = {c.name for c in results}
     assert names == {
         "claude_cli", "claude_login", "accessibility", "screen_recording",
-        "fish_api_key", "anthropic_key_leftover", "cross_session_inbound",
+        "edge_tts", "anthropic_key_leftover", "cross_session_inbound",
+        "edge_tts_reachability",
     }
 
 
@@ -532,7 +548,7 @@ async def test_run_checks_runs_all_registered_checks(monkeypatch):
 def test_spoken_summary_empty_when_all_ok():
     checks = [
         Check(name="claude_cli", status=STATUS_OK, message="ok"),
-        Check(name="fish_api_key", status=STATUS_OK, message="ok"),
+        Check(name="edge_tts", status=STATUS_OK, message="ok"),
     ]
     assert preflight.spoken_summary(checks) == ""
 
@@ -566,12 +582,12 @@ def test_spoken_summary_says_screen_recording_in_words_a_person_would_use():
 def test_spoken_summary_names_two_failures_and_matches_the_example():
     checks = [
         Check(name="claude_login", status=STATUS_FAIL, message="Claude Code is not logged in."),
-        Check(name="fish_api_key", status=STATUS_FAIL, message="FISH_API_KEY is not set."),
+        Check(name="edge_tts", status=STATUS_FAIL, message="edge_tts is not installed."),
     ]
     summary = preflight.spoken_summary(checks)
     assert summary == (
-        "Two things need attention, sir: Claude Code isn't logged in, "
-        "and I have no Fish Audio key."
+        "Two things need attention, sir: the agent isn't logged in, "
+        "and Edge TTS is not installed."
     )
 
 
@@ -596,3 +612,53 @@ def test_spoken_summary_warn_counts_as_something_wrong():
     summary = preflight.spoken_summary(checks)
     assert summary != ""
     assert "One thing needs attention" in summary
+
+
+# --- hermes backend: CLI + login -------------------------------------------
+
+@pytest.mark.asyncio
+async def test_hermes_cli_missing_from_path(monkeypatch):
+    monkeypatch.setenv("JARVIS_CLI_PATH", "hermes")
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: None)
+    check = await preflight._check_hermes_cli()
+    assert check.status == STATUS_FAIL
+    assert "PATH" in check.message
+
+
+@pytest.mark.asyncio
+async def test_hermes_cli_present_is_ok(monkeypatch):
+    monkeypatch.setenv("JARVIS_CLI_PATH", "hermes")
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: "/usr/local/bin/hermes")
+    monkeypatch.setattr(
+        preflight, "_run_subprocess",
+        _fake_run_subprocess({("/usr/local/bin/hermes", "--version"): (0, "hermes 1.2.3\n", "")}),
+    )
+    check = await preflight._check_hermes_cli()
+    assert check.status == STATUS_OK
+
+
+@pytest.mark.asyncio
+async def test_hermes_login_failure_names_setup(monkeypatch):
+    monkeypatch.setenv("JARVIS_CLI_PATH", "hermes")
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: "/usr/local/bin/hermes")
+    monkeypatch.setattr(
+        preflight, "_run_subprocess",
+        _fake_run_subprocess({("/usr/local/bin/hermes", "usage"): (1, "", "Invalid API key")}),
+    )
+    check = await preflight._check_hermes_login()
+    assert check.status == STATUS_FAIL
+    assert "hermes setup" in check.remedy
+
+
+@pytest.mark.asyncio
+async def test_hermes_backend_selects_hermes_checks(monkeypatch):
+    monkeypatch.setenv("JARVIS_CLI_PATH", "hermes")
+    assert [fn.__name__ for fn in preflight._selected_async_checks()] == [
+        "_check_hermes_cli", "_check_hermes_login", "_check_accessibility"]
+
+
+def test_claude_backend_selects_claude_checks(monkeypatch):
+    monkeypatch.delenv("JARVIS_CLI_PATH", raising=False)
+    monkeypatch.delenv("JARVIS_CLAUDE_PATH", raising=False)
+    assert [fn.__name__ for fn in preflight._selected_async_checks()] == [
+        "_check_claude_cli", "_check_claude_login", "_check_accessibility"]

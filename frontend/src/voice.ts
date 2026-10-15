@@ -18,6 +18,9 @@ export interface VoiceInput {
   /** Tear the recogniser down and build a new one, now. For when it is
    *  provably deaf: capturing audio and returning nothing. */
   restart(reason: string): void;
+  /** BCP-47 tag for newly started engines (e.g. "id-ID"). Engines already
+   *  listening keep theirs; the next rotation picks the new one up. */
+  setLanguage(tag: string): void;
 }
 
 const INTERIM_THROTTLE_MS = 200;
@@ -102,6 +105,13 @@ export function createMicMonitor(
   let complainedAt = 0;
 
   navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+    const track = stream.getAudioTracks()[0];
+    // Which physical mic the browser actually opened. When Chrome's STT
+    // hears nothing while this monitor hears sound, the first suspect is
+    // two different inputs — this line names ours in the mic log the
+    // server stores, so it can be compared against chrome://settings
+    // (Privacy → Microphone) instead of guessed at.
+    onEvent(`mic monitor attached: ${track ? track.label : "(no track)"}`);
     const ctx = new AudioContext();
     const source = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
@@ -153,7 +163,7 @@ export function createVoiceInput(
   if (!SR) {
     onError("Speech recognition not supported in this browser");
     onMicEvent("no SpeechRecognition in this browser");
-    return { start() {}, stop() {}, pause() {}, resume() {}, restart() {} };
+    return { start() {}, stop() {}, pause() {}, resume() {}, restart() {}, setLanguage() {} };
   }
 
   let shouldListen = false;
@@ -165,8 +175,19 @@ export function createVoiceInput(
   let interimFlush: ReturnType<typeof setTimeout> | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let stallNoticeAt = 0;
+  // Consecutive `network` failures with no transcript in between. The service
+  // is either unreachable (firewall/VPN) or absent in this browser build
+  // (Chromium snapshots have no Speech API keys — every session fails this
+  // way), so retrying at full speed only prolongs a throttling ban. Back off
+  // like `not-allowed`, and say the actionable thing once instead of
+  // flashing "dropped" every second.
+  let consecutiveNetworkErrors = 0;
+  let networkHintShown = false;
   // Any sign the user is mid-sentence. A rotation during one loses it.
   let lastHeardAt = 0;
+  // Recognition language for engines started from here on. Changed by the
+  // language button; a running engine keeps its tag until rotation.
+  let langTag = "en-US";
 
   const mark = (what: string) => {
     console.info(`[voice] ${new Date().toLocaleTimeString()} ${what}`);
@@ -218,6 +239,8 @@ export function createVoiceInput(
 
   function cancelRetry() {
     waitingForRetry = false;
+    consecutiveNetworkErrors = 0;
+    networkHintShown = false;
     if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   }
 
@@ -229,7 +252,7 @@ export function createVoiceInput(
     const sr = new SR();
     sr.continuous = true;
     sr.interimResults = true;
-    sr.lang = "en-US";
+    sr.lang = langTag;
     const e: Engine = { sr, running: false, audio: false, startedAt: 0, stoppedAt: 0, retired: false };
 
     sr.onstart = () => {
@@ -326,6 +349,10 @@ export function createVoiceInput(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function handleResult(event: any) {
     lastHeardAt = Date.now();
+    // The service answered: whatever was wrong before is over.
+    consecutiveNetworkErrors = 0;
+    networkHintShown = false;
+    retryDelay = 1000;
     let interim = "";
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const result = event.results[i];
@@ -372,7 +399,22 @@ export function createVoiceInput(
     } else if (event.error === "audio-capture") {
       onError("Another app has taken the microphone — quit it, then reload.");
     } else if (event.error === "network") {
-      onError("Speech recognition lost its connection — that sentence was dropped.");
+      consecutiveNetworkErrors++;
+      if (consecutiveNetworkErrors >= 5 && !networkHintShown) {
+        networkHintShown = true;
+        onError("Speech recognition is unreachable — use Google Chrome (not Chromium) and check this machine reaches Google. Retrying quietly.");
+      }
+      // Same backoff as `not-allowed`: the watchdog, onend and resume all
+      // honour waitingForRetry, so this stops the 1/sec restart hammer.
+      waitingForRetry = true;
+      const delay = retryDelay;
+      retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS);
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        waitingForRetry = false;
+        if (shouldListen && !paused) startSpare();
+      }, delay);
     } else {
       onError(`Speech recognition error: ${event.error}`);
     }
@@ -442,6 +484,9 @@ export function createVoiceInput(
       dropPendingInterim();
       stopAll(false);
     },
+    setLanguage(tag: string) {
+      langTag = tag;
+    },
     pause() {
       paused = true;
       dropPendingInterim();
@@ -482,6 +527,8 @@ export interface AudioPlayer {
   getAnalyser(): AnalyserNode;
   onPlayed(cb: (utt: number, idx: number) => void): void;
   onFinished(cb: () => void): void;
+  /** Live-session reply audio: raw 16-bit PCM at 24kHz mono. */
+  playPCM(int16: Int16Array, sampleRate?: number): void;
 }
 
 interface QueuedChunk {
@@ -613,6 +660,64 @@ export function createAudioPlayer(): AudioPlayer {
 
     onNeedsGesture(cb) {
       needsGestureCallback = cb;
+    },
+
+    playPCM(int16: Int16Array, sampleRate = 24000) {
+      try {
+        void ensureRunning().then(() => {
+          const buf = audioCtx.createBuffer(1, int16.length, sampleRate);
+          const ch = buf.getChannelData(0);
+          for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768;
+          const src = audioCtx.createBufferSource();
+          src.buffer = buf;
+          src.connect(analyser);
+          src.start();
+        });
+      } catch (err) {
+        console.error("[audio] pcm unplayable:", err);
+      }
+    },
+  };
+}
+
+export interface PCMInput {
+  start(): Promise<void>;
+  stop(): void;
+}
+
+/** Live-session mic: 16kHz mono Int16 PCM via ScriptProcessor. No Worklet file. */
+export function createPCMInput(onPCM: (pcm: Int16Array) => void): PCMInput {
+  let ctx: AudioContext | null = null;
+  let stream: MediaStream | null = null;
+  let proc: ScriptProcessorNode | null = null;
+  let running = false;
+  return {
+    async start() {
+      if (running) return;
+      running = true;
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      ctx = new AudioContext({ sampleRate: 16000 });
+      const src = ctx.createMediaStreamSource(stream);
+      proc = ctx.createScriptProcessor(4096, 1, 1);
+      proc.onaudioprocess = (e) => {
+        if (!running) return;
+        const f32 = e.inputBuffer.getChannelData(0);
+        const out = new Int16Array(f32.length);
+        for (let i = 0; i < f32.length; i++) {
+          const s = Math.max(-1, Math.min(1, f32[i]));
+          out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        onPCM(out);
+      };
+      src.connect(proc);
+      proc.connect(ctx.destination);
+    },
+    stop() {
+      running = false;
+      try { proc?.disconnect(); } catch { /* already gone */ }
+      try { ctx?.close(); } catch { /* already gone */ }
+      stream?.getTracks().forEach((t) => t.stop());
+      proc = null; ctx = null; stream = null;
     },
   };
 }

@@ -1,11 +1,12 @@
 """
 JARVIS preflight -- first-run environment checks.
 
-Every one of these has already bitten this project: `claude` missing or too
-old, not logged in (the voice brain runs on the user's *subscription*, never
-an API key -- see brain.py's SCRUBBED_ENV_PREFIXES), `crossSessionInbound`
-not accepting steers into other sessions, `osascript` lacking Accessibility
-so `answer_dialog`'s keystroke fails, and no Fish Audio key at all.
+Every one of these has already bitten this project: the agent CLI missing or
+too old, not logged in (the voice brain runs on the user's *subscription*,
+never an API key -- see brain.py's SCRUBBED_ENV_PREFIXES),
+`crossSessionInbound` not accepting steers into other sessions, `osascript`
+lacking Accessibility so `answer_dialog`'s keystroke fails, and no TTS
+engine at all.
 
 This module only *observes*. Nothing here writes a file, changes a setting,
 or grants a permission -- see `_check_cross_session_inbound_sync`'s
@@ -129,6 +130,84 @@ def _parse_version(text: str) -> Optional[tuple[int, int, int]]:
     if not m:
         return None
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+# ── which agent CLI ────────────────────────────────────────────────────
+
+def _cli_backend() -> str:
+    """'hermes' when JARVIS_CLI_PATH names Hermes Agent, else 'claude'."""
+    raw = os.getenv("JARVIS_CLI_PATH") or os.getenv("JARVIS_CLAUDE_PATH") or "claude"
+    return "hermes" if "hermes" in Path(raw).name else "claude"
+
+
+def _cli_binary() -> str:
+    raw = os.getenv("JARVIS_CLI_PATH") or os.getenv("JARVIS_CLAUDE_PATH")
+    if raw:
+        return raw.split()[0]
+    return "hermes" if _cli_backend() == "hermes" else "claude"
+
+
+async def _check_hermes_cli(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
+    """`hermes` is on PATH. No minimum version: unlike Claude Code, no
+    JARVIS feature depends on a version-gated Hermes flag."""
+    binary = _cli_binary()
+    resolved = shutil.which(binary) or (binary if Path(binary).exists() else None)
+    if not resolved:
+        return Check(
+            name="hermes_cli",
+            status=STATUS_FAIL,
+            message="`hermes` is not on PATH.",
+            remedy="Install Hermes Agent and make sure it's on PATH, "
+                   "or unset JARVIS_CLI_PATH to use Claude Code.",
+        )
+    rc, stdout, stderr = await _run_subprocess(resolved, "--version", timeout=timeout)
+    if rc != 0:
+        return Check(
+            name="hermes_cli",
+            status=STATUS_WARN,
+            message=f"`hermes --version` failed: {(stderr or stdout).strip() or f'exit {rc}'}",
+            remedy="Run `hermes --version` yourself to see what's wrong.",
+        )
+    version = (stdout or stderr).strip().splitlines()
+    detail = version[0][:80] if version else "on PATH"
+    return Check(name="hermes_cli", status=STATUS_OK, message=f"hermes {detail}.")
+
+
+async def _check_hermes_login(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
+    """The Hermes provider answers without starting a session.
+
+    `hermes usage` prints the account's rate-limit windows without opening
+    a session — the cheapest authenticated call it has. A non-zero exit
+    means the provider rejected the credentials.
+    """
+    binary = _cli_binary()
+    resolved = shutil.which(binary) or (binary if Path(binary).exists() else None)
+    if not resolved:
+        return Check(
+            name="hermes_login",
+            status=STATUS_WARN,
+            message="Can't check Hermes login: `hermes` is not on PATH.",
+            remedy="Install Hermes Agent and configure a provider with `hermes setup`.",
+        )
+    rc, stdout, stderr = await _run_subprocess(resolved, "usage", timeout=timeout)
+    if rc != 0:
+        text = (stderr or stdout).strip()[:200]
+        # Custom/OpenAI-compatible endpoints (e.g. a local proxy) have no
+        # usage endpoint at all — `hermes usage` exits 1 saying exactly
+        # that, while real turns authenticate fine. The brain's warm-up
+        # turn is the true auth check for these; failing here would nag on
+        # every boot over a probe that cannot succeed by design.
+        if "no usage endpoint" in text.lower():
+            return Check(name="hermes_login", status=STATUS_OK,
+                         message="Hermes provider reachable (no usage endpoint on custom providers).")
+        return Check(
+            name="hermes_login",
+            status=STATUS_FAIL,
+            message=f"`hermes usage` failed: {text or f'exit {rc}'}",
+            remedy="Run `hermes setup` in a terminal and configure a provider.",
+        )
+    return Check(name="hermes_login", status=STATUS_OK,
+                 message="Hermes provider answered.")
 
 
 # ── individual checks ────────────────────────────────────────────────────
@@ -439,15 +518,59 @@ def _check_screen_recording_sync() -> Check:
     )
 
 
-def _check_fish_api_key_sync() -> Check:
-    """FISH_API_KEY must be set or JARVIS has no voice."""
-    if os.environ.get("FISH_API_KEY"):
-        return Check(name="fish_api_key", status=STATUS_OK, message="FISH_API_KEY is set.")
+def _check_edge_tts_connectivity_sync() -> Check:
+    """Edge TTS requires no API key, but the edge_tts package must be installed."""
+    try:
+        import edge_tts  # noqa: F401
+        return Check(name="edge_tts", status=STATUS_OK,
+                     message="Edge TTS is available (no API key required).")
+    except ImportError:
+        return Check(
+            name="edge_tts",
+            status=STATUS_FAIL,
+            message="edge_tts is not installed.",
+            remedy="Run: pip install edge-tts",
+        )
+
+
+EDGE_TTS_HOST = "speech.platform.bing.com"
+EDGE_TTS_PORT = 443
+
+
+async def _probe_edge_tts_endpoint(host: str = EDGE_TTS_HOST,
+                                   port: int = EDGE_TTS_PORT,
+                                   timeout: float = 3.0) -> bool:
+    """TCP reachability to the Edge TTS endpoint. True when connectable."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+        try:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        finally:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def _check_edge_tts_reachability(timeout: float = 3.0) -> Check:
+    """Warn-only: offline box warns at boot instead of failing first utterance."""
+    try:
+        ok = await _probe_edge_tts_endpoint(timeout=timeout)
+    except Exception as e:  # never fail boot on a probe
+        return Check(name="edge_tts_reachability", status=STATUS_WARN,
+                     message=f"Edge TTS reachability unknown: {e}")
+    if ok:
+        return Check(name="edge_tts_reachability", status=STATUS_OK,
+                     message="Edge TTS endpoint reachable.")
     return Check(
-        name="fish_api_key",
-        status=STATUS_FAIL,
-        message="FISH_API_KEY is not set.",
-        remedy="Get a Fish Audio API key from fish.audio and set FISH_API_KEY in .env.",
+        name="edge_tts_reachability", status=STATUS_WARN,
+        message="Edge TTS endpoint unreachable — voice will fail until network returns.",
+        remedy="Check network/VPN; JARVIS boots anyway and retries at first utterance.",
     )
 
 
@@ -627,8 +750,16 @@ def enable_cross_session_inbound() -> tuple[bool, str]:
 # ── running them all ─────────────────────────────────────────────────────
 
 _ASYNC_CHECKS = (_check_claude_cli, _check_claude_login, _check_accessibility)
-_SYNC_CHECKS = (_check_fish_api_key_sync, _check_anthropic_key_leftover_sync,
+_SYNC_CHECKS = (_check_edge_tts_connectivity_sync, _check_anthropic_key_leftover_sync,
                 _check_cross_session_inbound_sync, _check_screen_recording_sync)
+_REACHABILITY_CHECKS = (_check_edge_tts_reachability,)
+
+
+def _selected_async_checks() -> tuple:
+    """The CLI checks for the configured backend; the rest never vary."""
+    if _cli_backend() == "hermes":
+        return (_check_hermes_cli, _check_hermes_login, _check_accessibility)
+    return _ASYNC_CHECKS
 
 
 async def _run_one(fn, *, is_async: bool, timeout: float) -> Check:
@@ -656,14 +787,21 @@ async def _run_one(fn, *, is_async: bool, timeout: float) -> Check:
         return Check(name=name, status=STATUS_WARN, message=f"Check '{name}' raised: {e}")
 
 
-async def run_checks(*, timeout: float = DEFAULT_CHECK_TIMEOUT) -> list[Check]:
+async def run_checks(*, timeout: float | None = None) -> list[Check]:
     """Run every environment check concurrently, each individually time-boxed.
 
     Never raises. Safe to call at startup: the worst case is a handful of
     `warn` results after `timeout` seconds, not a hung or crashed server.
+
+    The default budget is backend-aware: Hermes Agent spends ~15-30s on
+    plugin/MCP init before answering anything, so a 5s budget false-fails
+    every Hermes check at boot.
     """
-    tasks = [_run_one(fn, is_async=True, timeout=timeout) for fn in _ASYNC_CHECKS]
+    if timeout is None:
+        timeout = 30.0 if _cli_backend() == "hermes" else DEFAULT_CHECK_TIMEOUT
+    tasks = [_run_one(fn, is_async=True, timeout=timeout) for fn in _selected_async_checks()]
     tasks += [_run_one(fn, is_async=False, timeout=timeout) for fn in _SYNC_CHECKS]
+    tasks += [_run_one(fn, is_async=True, timeout=3.0) for fn in _REACHABILITY_CHECKS]
     return await asyncio.gather(*tasks)
 
 
@@ -675,16 +813,16 @@ async def run_checks(*, timeout: float = DEFAULT_CHECK_TIMEOUT) -> list[Check]:
 # the specific failure (e.g. "isn't installed" vs. "needs updating").
 def _phrase_for(check: Check) -> str:
     name, msg = check.name, check.message
-    if name == "claude_cli":
+    if name in ("claude_cli", "hermes_cli"):
         if "not on PATH" in msg:
-            return "Claude Code isn't installed"
+            return "the agent CLI isn't installed"
         if "older than" in msg:
             return "Claude Code needs updating"
-        return "Claude Code's version couldn't be checked"
-    if name == "claude_login":
-        if "not logged in" in msg:
-            return "Claude Code isn't logged in"
-        return "Claude Code's login couldn't be checked"
+        return "the agent CLI's version couldn't be checked"
+    if name in ("claude_login", "hermes_login"):
+        if "not logged in" in msg or "failed" in msg:
+            return "the agent isn't logged in"
+        return "the agent's login couldn't be checked"
     if name == "accessibility":
         if "not granted Accessibility" in msg:
             return "I don't have Accessibility permission"
@@ -693,8 +831,10 @@ def _phrase_for(check: Check) -> str:
         if "not been granted" in msg:
             return "I don't have Screen Recording permission"
         return "Screen Recording couldn't be checked"
-    if name == "fish_api_key":
-        return "I have no Fish Audio key"
+    if name == "edge_tts":
+        return "Edge TTS is not installed"
+    if name == "edge_tts_reachability":
+        return "Edge TTS is unreachable from here"
     if name == "anthropic_key_leftover":
         return "there's a leftover Anthropic API key in the environment"
     if name == "cross_session_inbound":

@@ -155,7 +155,7 @@ def test_every_settable_key_is_bounded(server):
     """The class, from `SETTABLE_ENV_KEYS` itself. A key added next year is
     bounded the day it is added, or this fails."""
     keys = sorted(server.SETTABLE_ENV_KEYS)
-    assert len(keys) >= 4, keys
+    assert len(keys) >= 2, keys
     for key in keys:
         problem = server._env_value_problem(key, "x" * 100_000)
         assert problem, f"{key} accepts a hundred thousand characters"
@@ -163,10 +163,9 @@ def test_every_settable_key_is_bounded(server):
 
 
 def test_a_name_is_bounded_more_tightly_than_a_key(server):
-    """A Fish Audio key is sixty-odd characters of opaque token. A NAME is a
-    name — and it is the one that is spliced into the brain's system prompt
-    (`brain.launch_prompt`: "The user's name is {…}") with nothing around
-    it, so it is the one that must not be a paragraph."""
+    """A NAME is a name — and it is the one that is spliced into the brain's
+    system prompt (`brain.launch_prompt`: "The user's name is {…}") with
+    nothing around it, so it is the one that must not be a paragraph."""
     for key in ("USER_NAME", "HONORIFIC"):
         assert key in server.ENV_NAME_KEYS, key
         assert server._env_value_problem(key, "x" * 200), key
@@ -184,14 +183,11 @@ def test_a_control_character_is_refused(server):
 
 
 def test_the_ordinary_settings_still_save(server):
-    for key, value in (("USER_NAME", "Tony"), ("HONORIFIC", "sir"),
-                       ("FISH_VOICE_ID", "b545c585f4d491a"),
-                       ("FISH_API_KEY", "x" * 64)):
+    for key, value in (("USER_NAME", "Tony"), ("HONORIFIC", "sir")):
         assert server._env_value_problem(key, value) is None, key
         server._write_env_key(key, value)
     _, parsed = server._read_env()
     assert parsed["USER_NAME"] == "Tony"
-    assert parsed["FISH_API_KEY"] == "x" * 64
 
 
 def test_the_route_refuses_rather_than_saving_half(server):

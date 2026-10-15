@@ -493,7 +493,7 @@ def test_settings_status_is_a_read_and_creates_nothing(env, monkeypatch,
     fake_env = tmp_path / "dotenv" / ".env"
     fake_env.parent.mkdir()
     example = tmp_path / "dotenv" / ".env.example"
-    example.write_text("FISH_API_KEY=your-fish-audio-api-key-here\n")
+    example.write_text("# Edge TTS needs no key\n")
     monkeypatch.setattr(server, "_env_file_path", lambda: fake_env)
     monkeypatch.setattr(server, "_env_example_path", lambda: example)
 

@@ -115,3 +115,16 @@ async def _no_run_left_mid_flight():
         task.cancel()
     if pending:
         await asyncio.wait(pending, timeout=5)
+
+
+@pytest.fixture(autouse=True)
+def _backend_selection_is_explicit(monkeypatch):
+    """No test inherits the developer's real `.env` backend choice.
+
+    `server` loads `.env` into `os.environ` at import (setdefault), so a
+    fixture that reloads it can leak JARVIS_CLI_PATH into every test after
+    it — flipping preflight's and the brain's backend mid-suite. Tests that
+    want Hermes set it themselves via monkeypatch.
+    """
+    monkeypatch.delenv("JARVIS_CLI_PATH", raising=False)
+    monkeypatch.delenv("JARVIS_CLAUDE_PATH", raising=False)

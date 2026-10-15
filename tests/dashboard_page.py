@@ -3,7 +3,7 @@
 WHY THIS EXISTS
 ---------------
 There are no frontend tests and there cannot be new ones of the usual kind:
-`package.json` has no test runner and "no new npm dependencies" is a hard
+`package.json` has no test runner and "no new bun dependencies" is a hard
 rule, so Jest and Vitest are both out. Every honesty rule in
 `frontend/src/dashboard/` was therefore enforced by a comment — including
 three that the comment described correctly and the code did the opposite of:
@@ -62,10 +62,10 @@ def why_unavailable() -> str | None:
         import playwright.async_api           # noqa: F401
     except ImportError:
         return "playwright is not installed in this environment"
-    if shutil.which("npm") is None:
-        return "npm is not on PATH, so the bundle cannot be built"
+    if shutil.which("bun") is None:
+        return "bun is not on PATH, so the bundle cannot be built"
     if not (FRONTEND / "node_modules").is_dir():
-        return "frontend/node_modules is missing (run `npm install`)"
+        return "frontend/node_modules is missing (run `bun install`)"
     return None
 
 
@@ -82,12 +82,12 @@ def _newest_source() -> float:
 def build_bundle() -> Path:
     """`frontend/dist`, rebuilt only if a source file is newer than it.
 
-    The same `npm run build` a developer runs — never a bespoke bundling
+    The same `bun run build` a developer runs — never a bespoke bundling
     path, or the thing under test stops being the thing that ships.
     """
     target = DIST / "dashboard.html"
     if not target.is_file() or target.stat().st_mtime < _newest_source():
-        subprocess.run(["npm", "run", "build"], cwd=FRONTEND, check=True,
+        subprocess.run(["bun", "run", "build"], cwd=FRONTEND, check=True,
                        capture_output=True, text=True,
                        timeout=BUILD_TIMEOUT_SEC)
     return DIST

@@ -170,7 +170,7 @@ _MP3_KBPS_V2 = {1: 8, 2: 16, 3: 24, 4: 32, 5: 40, 6: 48, 7: 56, 8: 64,
 
 def mp3_seconds(data: Optional[bytes]) -> float:
     """How long this MPEG Layer III audio plays, from its first frame header
-    (constant bitrate, which is what Fish Audio emits). 0.0 for anything
+    (constant bitrate, which is what Edge TTS emits). 0.0 for anything
     that is not one — no header, no floor."""
     if not data:
         return 0.0
@@ -222,11 +222,27 @@ SHORT_ECHO_GRACE_SEC = 0.75
 # staging files" shares one word in three.
 ECHO_SHARE_WHILE_AUDIBLE = 0.5
 SHORT_UTTERANCE_TOKENS = 2
+# A single CJK run can be a whole sentence (构建已经完成了先生 is one
+# token but nine characters). Length in characters decides for those;
+# word count decides for Latin.
+SHORT_CJK_CHARS = 4
+
+
+def _is_short_utterance(toks: list[str]) -> bool:
+    latin = sum(1 for t in toks if not _CJK_RE.search(t))
+    cjk_chars = sum(len(t) for t in toks if _CJK_RE.search(t))
+    return latin <= SHORT_UTTERANCE_TOKENS and cjk_chars <= SHORT_CJK_CHARS
 
 Synthesize = Callable[[str], Awaitable[Optional[bytes]]]
 Emit = Callable[[dict], Awaitable[None]]
 
-_TOKEN_RE = re.compile(r"[a-z0-9']+")
+_TOKEN_RE = re.compile(r"[a-z0-9']+|[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
+# CJK runs tokenize whole (你好世界 is one token, not four): single Han
+# characters collide constantly across unrelated sentences (的/是/在), and
+# per-character tokens would turn every Chinese turn into an "echo" of the
+# last one. The run still matches when the recogniser returns his sentence
+# intact, which is the only echo this rule is for.
 
 
 def _tokens(text: str) -> list[str]:
@@ -259,6 +275,8 @@ _REPLAY_TRIGGERS = frozenset({
     ("one", "more", "time"),
     ("pardon",),
     ("pardon", "me"),
+    ("再说一遍",),
+    ("再讲一遍",),
 })
 
 
@@ -587,7 +605,7 @@ class SpeechScheduler:
         if recent:
             matching = sum(1 for t in toks if t in recent)
             if matching / len(toks) >= 0.7 and len(toks) - matching < 2:
-                if (len(toks) <= SHORT_UTTERANCE_TOKENS
+                if (_is_short_utterance(toks)
                         and self._since_last_ack() > SHORT_ECHO_GRACE_SEC):
                     return "speech"     # his word, but the user's mouth: see SHORT_ECHO_GRACE_SEC
                 return "echo"

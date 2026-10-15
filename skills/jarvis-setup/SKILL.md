@@ -35,13 +35,15 @@ else looks fine, the first question is "did the URL's port change" — check
 `chrome://settings/content/microphone` for the exact origin in use, not just
 "is the mic allowed somewhere."
 
-## JARVIS runs on the Claude Code subscription — never an API key
+## JARVIS runs on the agent-CLI login — never an API key
 
-The voice brain (`brain.py`) is one long-lived `claude -p` process
-authenticated by the user's `claude` login, not the Anthropic API.
+The voice brain (`brain.py`) is one agent session authenticated by the user's
+CLI login, not the Anthropic API: a long-lived `claude -p` process by
+default, or per-turn `hermes chat --resume` subprocesses when
+`JARVIS_CLI_PATH` names Hermes Agent.
 `claude_env.child_env()` strips every `ANTHROPIC_*` variable (and
 `CLAUDE_CODE_*`, `CLAUDECODE`) from the environment handed to every spawned
-Claude Code child — brain and run pipeline alike — for one reason: the CLI
+child — brain and run pipeline alike — for one reason: the Claude CLI
 silently *prefers* an inherited `ANTHROPIC_API_KEY` over the logged-in
 session, without saying so (`claude auth status` still reports
 `loggedIn: true` while billing moves to the key). So:
@@ -51,7 +53,8 @@ session, without saying so (`claude auth status` still reports
   misunderstanding, and is worth flagging if you see it.
 - Setup is exactly: install Claude Code (`npm install -g
   @anthropic-ai/claude-code`, 2.1.224 or newer) and run `claude` once to log
-  in with a Claude subscription. No key, anywhere.
+  in with a Claude subscription — or set `JARVIS_CLI_PATH=hermes` and run
+  `hermes setup` to configure a provider. No key, anywhere.
 
 ## An expired login sounds like a JARVIS problem, not an auth problem
 
@@ -92,14 +95,13 @@ does not follow the app there. Move it to `/Applications` and relaunch.
 error `-1728` / "not allowed assistive access") without ever triggering the
 permission prompt itself, and its remedy text carries this same guidance.
 
-## `FISH_API_KEY` is genuinely required — there is no fallback voice
+## Edge TTS needs no key — but it does need its package
 
-`tts.py` calls the Fish Audio API directly; if the key is missing or empty,
-`synthesize_chunk` simply returns `None` — no error, no local TTS, no
-built-in voice of any kind. Without a real key from
-[fish.audio](https://fish.audio/), JARVIS has no voice at all, which reads
-to a new user as "it's just broken." This is the one piece of setup that
-cannot be skipped or worked around.
+`tts.py` calls Microsoft Edge TTS via the `edge-tts` package (in
+requirements.txt); there is no API key to set up. If the package is missing
+or the machine is offline, `synthesize_chunk` returns `None` and JARVIS's
+replies appear as text in the browser instead of speech. `preflight.py`'s
+`edge_tts` check says which of the two it is at startup.
 
 ## Connecting a service: one file, and it is not the one you'd guess
 

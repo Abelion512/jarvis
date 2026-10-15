@@ -59,7 +59,6 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Optional
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -95,9 +94,69 @@ log = logging.getLogger("jarvis")
 # Config
 # ---------------------------------------------------------------------------
 
-FISH_API_KEY = os.getenv("FISH_API_KEY", "")
-FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
-FISH_API_URL = "https://api.fish.audio/v1/tts"
+# Edge TTS: no API key required. Voice selection is per-language via tts.VOICE_MAP.
+from contextvars import ContextVar
+
+# Language of the turn in flight ("en" | "id" | "zh"), set by
+# _handle_utterance from the transcript's `lang` tag. A ContextVar (not a
+# global) so overlapping utterances — barge-ins, URGENT interrupts — each
+# keep their own voice instead of racing on one variable.
+_tts_lang: ContextVar[str] = ContextVar("jarvis_tts_lang", default="en")
+_TTS_LANGS = frozenset({"en", "id", "zh"})
+
+
+def _normalize_lang(raw) -> str:
+    """A WS `lang` tag → en|id|zh. Old frontends send none, typos send
+    anything; both become English, never an exception."""
+    lang = str(raw or "en").strip().lower()
+    return lang if lang in _TTS_LANGS else "en"
+
+
+def _resolve_transcript_lang(raw) -> str:
+    """Transcript language: explicit tag wins, missing/typo falls back to
+    the user's preferred language. Tagless in an id-major profile speaks id."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        pref = _read_profile().get("preferred_lang", "en")
+        return pref if pref in _TTS_LANGS else "en"
+    return _normalize_lang(raw)
+
+
+# Common Indonesian function words. Latin-script transcripts that carry
+# several of these are Indonesian; otherwise English. Used when the source
+# provides no language of its own (Gemini transcripts, untagged clients) —
+# never over a tag the client actually sent.
+_ID_MARKERS = frozenset({
+    "yang", "dan", "di", "ke", "dari", "untuk", "dengan", "ini", "itu",
+    "saya", "kamu", "anda", "tidak", "bisa", "mau", "apa", "siapa", "kapan",
+    "bagaimana", "kenapa", "adalah", "sudah", "belum", "juga", "saja",
+    "kalau", "karena", "tetapi", "sangat", "banyak", "kita", "mereka",
+    "tersebut", "antara", "oleh", "pada", "halo", "terima", "kasih",
+})
+
+
+def detect_lang(text: str) -> str:
+    """One language for a transcript, no modes or buttons: zh when CJK is
+    present, id when Indonesian markers outnumber English signals, else en.
+    Deterministic and dependency-free; the Live session does its own
+    finer-grained detection, this is the fallback every path shares."""
+    import re as _dt_re
+    lowered = (text or "").lower()
+    if _dt_re.search(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]", lowered):
+        return "zh"
+    words = _dt_re.findall(r"[a-z']+", lowered)
+    if not words:
+        return "en"
+    hits = sum(1 for w in words if w in _ID_MARKERS)
+    if hits >= 2 or (hits == 1 and len(words) <= 4):
+        return "id"
+    return "en"
+
+
+# Language of the latest user turn, for tool calls that need it. Plain
+# variable, not a ContextVar: /internal/tool runs in its own HTTP-request
+# task, which does not inherit the turn's context. Last-writer-wins under
+# true overlap; turns serialize on the brain lock in practice.
+turn_lang = "en"
 USER_NAME = os.getenv("USER_NAME", "sir")
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
@@ -326,7 +385,11 @@ async def scan_projects() -> list[dict]:
 # Speech-to-Text Corrections
 # ---------------------------------------------------------------------------
 
-STT_CORRECTIONS = {
+# English-only mis-hears. Applied to `en` turns ONLY — running them over
+# Indonesian or Chinese text corrupts real words (e.g. "cloud" is a word,
+# not a mis-hearing, outside English). Name fixes that hold in every
+# language live in NAME_CORRECTIONS below.
+STT_CORRECTIONS_EN = {
     r"\bcloud code\b": "Claude Code",
     r"\bclock code\b": "Claude Code",
     r"\bquad code\b": "Claude Code",
@@ -334,18 +397,292 @@ STT_CORRECTIONS = {
     r"\bclod code\b": "Claude Code",
     r"\bcloud\b": "Claude",
     r"\bquad\b": "Claude",
+}
+
+# Heard in every language, meant in every language.
+NAME_CORRECTIONS = {
     r"\btravis\b": "JARVIS",
     r"\bjarves\b": "JARVIS",
 }
 
+# Back-compat alias: the shipped English guesses as one map.
+STT_CORRECTIONS = {**STT_CORRECTIONS_EN, **NAME_CORRECTIONS}
 
-def apply_speech_corrections(text: str) -> str:
-    """Fix common speech-to-text errors before processing."""
+
+def _correction_sub(pattern: str, meant: str, text: str) -> str:
+    """One correction pass. The replacement runs through a function, never
+    as a template: a `meant` containing `\\1` or `\\g<0>` (user-controlled,
+    up to 40 chars) must insert literally, not expand against the transcript
+    or raise re.error."""
     import re as _stt_re
+    return _stt_re.sub(pattern, lambda _m: meant, text, flags=_stt_re.IGNORECASE)
+
+
+def _heard_pattern(heard: str) -> str:
+    """Match `heard` as a whole word where words exist.
+
+    `\\b` needs a `\\w` transition, so CJK phrases never match with it —
+    without this branch learning is silently dead for Chinese. Non-Latin
+    phrases match as plain substrings instead.
+    """
+    import re as _stt_re
+    escaped = _stt_re.escape(heard)
+    if _stt_re.search(r"[^\x00-\x7f]", heard):
+        return escaped
+    return r"\b" + escaped + r"\b"
+
+
+def apply_speech_corrections(text: str, lang: str = "en") -> str:
+    """Fix common speech-to-text errors before processing.
+
+    Learned corrections (what the user taught via `learn_correction`) run
+    FIRST, so a user's own ear overrules the shipped guesses below. Each
+    learned pair carries the language it was taught in and only applies to
+    turns in that language; pairs taught before languages existed apply
+    everywhere. The shipped English guesses apply to `en` turns only.
+    """
+    lang = (lang or "en").lower()
     result = text
-    for pattern, replacement in STT_CORRECTIONS.items():
-        result = _stt_re.sub(pattern, replacement, result, flags=_stt_re.IGNORECASE)
+    hits: list[str] = []
+    for heard, entry in _learned_corrections().items():
+        if isinstance(entry, dict):
+            meant, entry_lang = entry.get("meant", ""), entry.get("lang")
+            if entry_lang and entry_lang != lang:
+                continue
+        else:
+            meant = entry
+        if not meant:
+            continue
+        import re as _stt_re
+        result, n = _stt_re.subn(_heard_pattern(heard), lambda _m: str(meant),
+                                 result, flags=_stt_re.IGNORECASE)
+        if n > 0 and isinstance(entry, dict):
+            hits.append(heard)
+    if lang == "en":
+        for pattern, replacement in STT_CORRECTIONS_EN.items():
+            result = _correction_sub(pattern, replacement, result)
+    for pattern, replacement in NAME_CORRECTIONS.items():
+        result = _correction_sub(pattern, replacement, result)
+    if hits:
+        _bump_correction_hits(hits)
+    _bump_correction_turn()
     return result
+
+
+_HIT_SATURATE = 9999
+_correction_turn = 0  # transcripts seen; ages learned pairs for pruning
+
+
+def _bump_correction_turn() -> int:
+    global _correction_turn
+    _correction_turn += 1
+    return _correction_turn
+
+
+def prune_dead_corrections(max_age_turns: int = 50) -> int:
+    """Retire zero-hit pairs older than N turns. Returns removals."""
+    with _profile_lock:
+        profile = _read_profile()
+        corrections = profile.get("corrections")
+        if not isinstance(corrections, dict):
+            return 0
+        dead = [h for h, e in corrections.items()
+                if isinstance(e, dict)
+                and int(e.get("hits", 0) or 0) == 0
+                and (_correction_turn - int(e.get("added_turn", 0) or 0)) >= max_age_turns]
+        for h in dead:
+            del corrections[h]
+        if dead:
+            profile["corrections"] = corrections
+            _write_profile(profile)
+        return len(dead)
+
+
+def _bump_correction_hits(heard_keys: list) -> None:
+    """Count that these learned pairs fired. Saturating, never unbounded —
+    the counter answers "does anyone use this pair" for future pruning."""
+    if not heard_keys:
+        return
+    with _profile_lock:
+        profile = _read_profile()
+        corrections = profile.get("corrections")
+        if not isinstance(corrections, dict):
+            return
+        changed = False
+        for heard in heard_keys:
+            entry = corrections.get(heard)
+            if isinstance(entry, dict):
+                entry["hits"] = min(int(entry.get("hits", 0) or 0) + 1, _HIT_SATURATE)
+                entry["last_hit_turn"] = _correction_turn
+                changed = True
+        if changed:
+            _write_profile(profile)
+
+
+# ---------------------------------------------------------------------------
+# Learned profile: STT corrections + language preference
+# ---------------------------------------------------------------------------
+# The recursive half of memory. `remember` keeps facts the brain wrote down;
+# this keeps what USE taught: how the user is mis-heard, and which language
+# they actually speak. Both are read on the hot path (every transcript), so
+# the file stays one small JSON document and every reader tolerates its
+# absence — a deleted profile restarts learning, nothing breaks.
+
+_PROFILE_CORRECTION_MAX = 100
+_PROFILE_TEXT_MAX = 40
+
+
+# Tool HTTP handlers run sync in FastAPI worker threads while turns run on
+# the loop thread: the read-modify-write below needs a real lock, or a
+# correction taught mid-turn loses the turn's language count.
+_profile_lock = threading.Lock()
+
+
+def _read_profile() -> dict:
+    """The learned profile, or {} — missing, corrupt, and wrong-shaped all
+    mean "nothing learned yet", never an error."""
+    try:
+        import data_paths
+        raw = data_paths.profile_path().read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_profile(profile: dict) -> None:
+    try:
+        import data_paths
+        path = data_paths.profile_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic: a crash mid-write must not leave a truncated profile behind
+        # (the reader tolerates it, but the learning would be silently lost).
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        log.warning(f"could not write learned profile: {e}")
+
+
+def _learned_corrections() -> dict:
+    """heard-lowercase → meant (legacy string) or {"meant", "lang"}.
+
+    Entries that no longer look sane are skipped, never fatal: this runs on
+    the transcript hot path and the file is user data.
+    """
+    raw = _read_profile().get("corrections")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for h, entry in raw.items():
+        if isinstance(entry, dict):
+            meant = str(entry.get("meant") or "")
+        else:
+            meant = str(entry or "")
+        if (h and meant and len(str(h)) <= _PROFILE_TEXT_MAX
+                and len(str(meant)) <= _PROFILE_TEXT_MAX):
+            out[str(h)] = entry
+    return out
+
+
+def _correction_problem(heard: str, meant: str) -> str | None:
+    """Why this pair cannot be learned, or None. Spoken back on refusal, so
+    it must read as one plain sentence."""
+    if not heard or not meant:
+        return "I need both what you said and what I heard, sir."
+    if len(heard) > _PROFILE_TEXT_MAX or len(meant) > _PROFILE_TEXT_MAX:
+        return "Keep both halves under forty characters, sir."
+    if heard.lower() == meant.lower():
+        return "Those are the same words, sir."
+    if any(ord(c) < 32 for c in heard + meant):
+        return "Letters and spaces only, sir."
+    return None
+
+
+def learn_correction(heard: str, meant: str, lang: str = "en") -> str | None:
+    """Teach one mis-hearing. Returns the refusal line, or None on success.
+
+    Each pair is tagged with the turn's language and only rewrites turns in
+    that language — an Indonesian fix must never rewrite English.
+    """
+    heard = (heard or "").strip()
+    meant = (meant or "").strip()
+    lang = (lang or "en").lower()
+    if lang not in _TTS_LANGS:
+        lang = "en"
+    problem = _correction_problem(heard, meant)
+    if problem:
+        return problem
+    profile = _read_profile()
+    with _profile_lock:
+        # Re-read under the lock: a turn may have counted a language (or
+        # another request taught a pair) between our read and now.
+        profile = _read_profile()
+        corrections = profile.get("corrections")
+        if not isinstance(corrections, dict):
+            corrections = {}
+        corrections[heard.lower()] = {"meant": meant, "lang": lang,
+                                      "hits": 0, "added_turn": _correction_turn}
+        while len(corrections) > _PROFILE_CORRECTION_MAX:
+            corrections.pop(next(iter(corrections)))
+        profile["corrections"] = corrections
+        _write_profile(profile)
+    return None
+
+
+def forget_correction(heard: str) -> bool:
+    """Forget one taught pair. True when something was removed."""
+    key = (heard or "").strip().lower()
+    if not key:
+        return False
+    with _profile_lock:
+        profile = _read_profile()
+        corrections = profile.get("corrections")
+        if not isinstance(corrections, dict) or key not in corrections:
+            return False
+        del corrections[key]
+        profile["corrections"] = corrections
+        _write_profile(profile)
+    return True
+
+
+def list_corrections() -> list[dict]:
+    """Every taught pair, oldest first. Read-only: never gated."""
+    out = []
+    for heard, entry in _learned_corrections().items():
+        if isinstance(entry, dict):
+            out.append({"heard": heard, "meant": entry.get("meant", ""),
+                        "lang": entry.get("lang", "en"),
+                        "hits": int(entry.get("hits", 0) or 0)})
+        else:
+            out.append({"heard": heard, "meant": entry, "lang": "en", "hits": 0})
+    return out
+
+
+def note_language(lang: str) -> str:
+    """Count one turn in `lang`; returns the preferred language now.
+
+    Preferred is the majority count, ties going to the most recent turn —
+    so the first Indonesian sentence already flips a fresh install, and a
+    bilingual user lands on whichever they use more.
+    """
+    lang = (lang or "").lower()
+    if lang not in _TTS_LANGS:
+        return _read_profile().get("preferred_lang", "en")
+    with _profile_lock:
+        profile = _read_profile()
+        counts = profile.get("lang_counts")
+        if not isinstance(counts, dict):
+            counts = {}
+        counts[lang] = int(counts.get(lang, 0) or 0) + 1
+        profile["lang_counts"] = counts
+        preferred = max(sorted(counts), key=lambda k: (int(counts[k] or 0), k == lang))
+        profile["preferred_lang"] = preferred
+        _write_profile(profile)
+    return preferred
 
 
 # ---------------------------------------------------------------------------
@@ -457,36 +794,22 @@ _last_greeting_time: float = 0
 
 
 # ---------------------------------------------------------------------------
-# TTS (Fish Audio)
+# TTS (Edge TTS)
 # ---------------------------------------------------------------------------
 
 async def synthesize_speech(text: str) -> Optional[bytes]:
-    """Generate speech audio from text using Fish Audio TTS."""
-    if not FISH_API_KEY:
-        log.warning("FISH_API_KEY not set, skipping TTS")
-        return None
+    """Generate speech audio from text using Edge TTS.
 
+    No API key required — uses Microsoft Edge's online TTS service.
+    Speaks in the turn's language (see _tts_lang).
+    """
     try:
-        async with httpx.AsyncClient(timeout=15.0) as http:
-            response = await http.post(
-                FISH_API_URL,
-                headers={
-                    "Authorization": f"Bearer {FISH_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "text": text,
-                    "reference_id": FISH_VOICE_ID,
-                    "format": "mp3",
-                },
-            )
-            if response.status_code == 200:
-                _session_tokens["tts_calls"] += 1
-                _append_usage_entry(0, 0, "tts")
-                return response.content
-            else:
-                log.error(f"TTS error: {response.status_code}")
-                return None
+        r = await tts.synthesize_chunk(text, language=_tts_lang.get())
+        if r is None:
+            return None
+        _session_tokens["tts_calls"] += 1
+        _append_usage_entry(0, 0, "tts")
+        return r.audio
     except Exception as e:
         log.error(f"TTS error: {e}")
         return None
@@ -503,7 +826,6 @@ brain_instance: Optional[Brain] = None
 speech: Optional[SpeechScheduler] = None
 session_watcher: "session_watch.SessionWatcher | None" = None
 session_clients: set = set()
-_tts_client: Optional[httpx.AsyncClient] = None
 _brain_notice_at = {"restarting": 0.0}
 _bg_tasks: set[asyncio.Task] = set()
 _CONTENT_FRAMES = ("audio", "text")
@@ -611,13 +933,38 @@ async def _voice_emit(msg: dict) -> None:
 
 
 async def _synth_for_speech(text: str) -> Optional[bytes]:
-    r = await tts.synthesize_chunk(text, api_key=FISH_API_KEY, voice_id=FISH_VOICE_ID, client=_tts_client)
+    r = await tts.synthesize_chunk(text, language=_resolve_chunk_lang(text))
     if r is None:
         return None
     _session_tokens["tts_calls"] += 1
     _append_usage_entry(0, 0, "tts")
     log.debug(f"tts: {len(text)} chars, first byte {r.first_byte_sec:.2f}s, total {r.total_sec:.2f}s")
     return r.audio
+
+
+def _resolve_chunk_lang(chunk: str) -> str:
+    """One voice per chunk, so a code-switched reply speaks each part
+    natively ("Baik sir, the build is done" splits into id then en chunks).
+
+    The turn language is overridden only on strong signals: CJK characters
+    (unambiguous) or 2+ Indonesian markers. Otherwise the turn wins — a
+    short "Ya" inside an Indonesian turn must not flip to an English voice
+    on zero evidence. When the turn itself is English, the detector decides.
+    """
+    import re as _cl_re
+    turn = _tts_lang.get()
+    if _cl_re.search(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]", chunk or ""):
+        return "zh"
+    if turn == "en":
+        return detect_lang(chunk)
+    words = _cl_re.findall(r"[a-z']+", (chunk or "").lower())
+    if sum(1 for w in words if w in _ID_MARKERS) >= 2:
+        return "id"
+    if turn == "zh" and words:
+        # A script switch is itself the signal: Latin-only text inside a
+        # Chinese turn is code-switched English, not pinyin.
+        return "en"
+    return turn
 
 
 def _fmt_reset(ts) -> str:
@@ -939,8 +1286,7 @@ def _active_project_names() -> list[str]:
 
 
 async def start_brain_and_speech() -> None:
-    global brain_instance, speech, _tts_client
-    _tts_client = httpx.AsyncClient(timeout=15.0)
+    global brain_instance, speech
     speech = SpeechScheduler(lambda t: _synth_for_speech(t), _voice_emit, prepare=strip_markdown_for_tts,
                              transport_ready=lambda: bool(voice_clients))
     await speech.start()
@@ -1112,7 +1458,9 @@ async def _maybe_rotate() -> None:
         except Exception:                       # never let a notice stop a rotation
             pass
         if not _handover_collected:
-            _pending_handover = await _ask_for_journal()
+            # Bounded like the shutdown path: a hung outgoing brain must not
+            # stall rotation (and its notice banner) indefinitely.
+            _pending_handover = await _ask_for_journal(timeout=SHUTDOWN_JOURNAL_TIMEOUT)
             _handover_collected = True
             if _pending_handover:
                 _write_journal(_pending_handover, reason="rotation")
@@ -1139,9 +1487,9 @@ async def _maybe_rotate() -> None:
 
 
 async def stop_brain_and_speech() -> None:
-    """Stop the brain first (no more turns), then the mouth, then the HTTP client.
+    """Stop the brain first (no more turns), then the mouth.
     Each step is isolated so one failure cannot leak the others."""
-    global brain_instance, speech, _tts_client
+    global brain_instance, speech
     # A generation must never vanish without a trace. The entry is written
     # whether or not the brain was in a state to write one itself, and the
     # whole step is wrapped: journalling must never prevent shutdown.
@@ -1164,15 +1512,14 @@ async def stop_brain_and_speech() -> None:
     except Exception as e:
         log.warning(f"shutdown journal failed: {e}")
     for label, coro in (("brain", brain_instance.stop() if brain_instance else None),
-                        ("speech", speech.stop() if speech else None),
-                        ("tts client", _tts_client.aclose() if _tts_client else None)):
+                        ("speech", speech.stop() if speech else None)):
         if coro is None:
             continue
         try:
             await coro
         except Exception as e:
             log.warning(f"shutdown: {label} did not stop cleanly: {e}")
-    brain_instance, speech, _tts_client = None, None, None
+    brain_instance, speech = None, None
 
 
 # Completions are held and spoken together at the next pause: the user asked
@@ -1552,6 +1899,35 @@ async def stop_session_watcher() -> None:
 TURN_SETTLE_TIMEOUT = 120.0
 
 
+# What the screen says while a tool runs: category prose, never identifiers.
+# Keyed by turn language (turn_lang): the notice is for the user, so it
+# speaks their language like everything else.
+_TOOL_NOTICE_LINES = {
+    "reading": {"en": "Looking it up…", "id": "Mencari…", "zh": "查找中…"},
+    "memory": {"en": "Noting that down…", "id": "Mencatat…", "zh": "记录中…"},
+    "acting": {"en": "Working on it…", "id": "Lagi dikerjakan…", "zh": "处理中…"},
+}
+
+
+def _tool_notice_line(name: str) -> str:
+    """Plain-words notice for a tool start, or "" when unnamed.
+
+    Tool names arrive namespaced (`mcp__jarvis__read_file`) or bare
+    (`WebSearch`); the registry keys are bare, so the prefix comes off.
+    """
+    if not name:
+        return ""
+    bare = name.removeprefix("mcp__jarvis__")
+    if bare in MEMORY_WRITERS or name in MEMORY_WRITERS:
+        kind = "memory"
+    elif bare in TAINTING_TOOLS or name in TAINTING_TOOLS:
+        kind = "reading"
+    else:
+        kind = "acting"
+    lang = turn_lang if turn_lang in _TTS_LANGS else "en"
+    return _TOOL_NOTICE_LINES[kind].get(lang, _TOOL_NOTICE_LINES[kind]["en"])
+
+
 class _OneLinePerTurn:
     """A turn that uses a tool says exactly one thing, at the end.
 
@@ -1598,14 +1974,22 @@ class _OneLinePerTurn:
             self._flush()
             self._streaming = True
 
-    def tool_started(self) -> None:
-        """A tool call: everything written up to here was an intention."""
+    def tool_started(self, name: str = "") -> None:
+        """A tool call: everything written up to here was an intention.
+
+        Names the work on screen (a `notice` frame: shown, never spoken),
+        in plain words by category — never the raw identifier. `name` has
+        a default because older callers invoke the hook bare.
+        """
         if self._held:
             log.info("speech: dropped narration before a tool: %r",
                      "".join(self._held)[:60])
         self._held.clear()
         self._tool_seen = True
         self._streaming = False     # hold again; more tools may follow
+        line = _tool_notice_line(name)
+        if line:
+            _spawn(_voice_emit({"type": "notice", "text": line}))
 
     def finish(self) -> None:
         """End of turn: say the one thing that survived."""
@@ -1621,11 +2005,23 @@ class _OneLinePerTurn:
             self._sink(text)
 
 
-async def _handle_utterance(text: str) -> None:
+# How long a brain turn may run silent before JARVIS says he's on it.
+# Hermes turns take 40s+ to first audio; eight seconds of dead air reads as
+# broken, so one short filler bridges it. Per-language, like everything spoken.
+FILLER_AFTER_SEC = 8.0
+FILLER_LINES = {
+    "en": "One moment, sir.",
+    "id": "Sebentar, sir.",
+    "zh": "请稍等。",
+}
+
+
+async def _handle_utterance(text: str, lang: str = "en") -> None:
     """One user utterance → one brain turn → streamed speech. Runs as a task so
     the socket loop keeps receiving `played` acks and interim text meanwhile."""
     if brain_instance is None or speech is None:
         return
+    note_language(lang)
     t0 = time.monotonic()
     await _voice_emit({"type": "status", "state": "thinking"})
     if not brain_instance.ready:
@@ -1637,13 +2033,53 @@ async def _handle_utterance(text: str) -> None:
             line = "One moment, sir — my language systems are still starting."
         await speech.say(line, Priority.NORMAL)
         return
+    token = _tts_lang.set(lang if lang in _TTS_LANGS else "en")
+    global turn_lang
+    turn_lang = lang if lang in _TTS_LANGS else "en"
+    # Sidechat: a newer utterance supersedes a still-running voice turn
+    # instead of queuing ~70s behind it. Runs are untouched — only the
+    # in-flight brain turn for this conversation is replaced.
+    supersede = getattr(brain_instance, "supersede_turn", None)
+    if callable(supersede):
+        supersede()
+    # The persona says "reply in the user's language", but persona
+    # compliance is a hope, not a mechanism — and on the Hermes backend
+    # the launch prompt only rides the first turn. Tag non-English turns
+    # explicitly so the reply language never depends on a guess. English
+    # turns pass through verbatim (every existing test pins that).
+    brain_text = (f"[user language: { {'id': 'Indonesian', 'zh': 'Chinese'}[lang]}] {text}"
+                  if lang in ("id", "zh") else text)
     utt = speech.begin_turn()
+    filler_done = asyncio.Event()
+
+    async def _filler_watchdog() -> None:
+        """Say one short line if the turn stays silent past FILLER_AFTER_SEC.
+
+        Cancelled by the first delta (below) or when the turn ends. The line
+        is its own utterance, so it can never wedge or delay the answer —
+        it just plays first in the queue.
+        """
+        try:
+            await asyncio.sleep(FILLER_AFTER_SEC)
+        except asyncio.CancelledError:
+            return
+        if filler_done.is_set() or utt.done:
+            return
+        await speech.say(FILLER_LINES.get(lang, FILLER_LINES["en"]), Priority.NORMAL)
+
+    filler_task = asyncio.create_task(_filler_watchdog())
     try:
         try:
             try:
+                def _delta_with_filler_cancel(d: str) -> None:
+                    if not filler_done.is_set():
+                        filler_done.set()
+                        filler_task.cancel()
+                    hold.delta(d)
+
                 hold = _OneLinePerTurn(lambda d: speech.feed(utt, d))
-                result = await brain_instance.turn(text, origin="user",
-                                                   on_delta=hold.delta,
+                result = await brain_instance.turn(brain_text, origin="user",
+                                                   on_delta=_delta_with_filler_cancel,
                                                    on_tool=hold.tool_started)
                 hold.finish()    # the one line this turn is allowed
             finally:
@@ -1667,12 +2103,19 @@ async def _handle_utterance(text: str) -> None:
         # first_audio is only known once the scheduler has sent the first chunk;
         # wait for playback so the latency line is accurate rather than early.
         await speech.wait_for(utt, timeout=120.0)
+        # The tool notice has served its purpose; clear it so stale
+        # "working on it" text never sits under the spoken answer.
+        await _voice_emit({"type": "notice", "text": ""})
         first_audio = (utt.first_sent_at - t0) if utt.first_sent_at is not None else None
         log.info("latency: first_delta=%s first_audio=%s turn=%.2fs ctx=%d out=%d tools=%s",
                  f"{result.first_delta_sec:.2f}s" if result.first_delta_sec is not None else "none",
                  f"{first_audio:.2f}s" if first_audio is not None else "none",
                  result.duration_sec, result.context_tokens, result.output_tokens, result.tools)
     finally:
+        _tts_lang.reset(token)
+        filler_done.set()
+        if not filler_task.done():
+            filler_task.cancel()
         # Anything the brain staged mid-turn (a steer) happens HERE, once the
         # turn utterance is genuinely done and the mouth is free — never
         # inside the tool call, which would queue the read-back behind the
@@ -1856,9 +2299,9 @@ async def health():
 async def tts_test():
     """Generate a test audio clip for debugging.
 
-    A POST, not a GET, because it spends the user's Fish Audio quota — and a
-    GET is the one method OriginGuard cannot cover, so as a GET this was an
-    <img> tag on any page the user visited, in a loop.
+    A POST, not a GET, because it spends time and bandwidth on a synthesis
+    call — and a GET is the one method OriginGuard cannot cover, so as a GET
+    this was an <img> tag on any page the user visited, in a loop.
     """
     audio = await synthesize_speech("Testing audio, sir.")
     if audio:
@@ -2393,6 +2836,12 @@ TAINT_EXEMPT_TOOLS = {
     "open_in_editor": "it opens a window, it does not read",
     "enable_session_inbox": "it edits a settings file, it does not read",
     "remember": "it writes a memory, it does not read",
+    "learn_correction": "it writes a hearing correction, it does not read",
+    "forget_correction": "it deletes a hearing correction, it does not read",
+    "list_corrections": (
+        "it reads JARVIS's own correction list, which already rewrites "
+        "every transcript — tainting on read would be theatre, and what "
+        "actually protects it is that the WRITERS are gated"),
     "project_note": "it writes a note, it does not read",
     "write_journal": "it writes the journal, it does not read",
 }
@@ -2432,13 +2881,15 @@ TAINT_EXEMPT_ACTING = {"answer_dialog"}
 # the model's text verbatim into `memory/*.md` and `add_to_index` into
 # `MEMORY.md`, which `CLAUDE.md` `@`-imports into every future turn as TRUSTED
 # system text. A run can be asked for again in a second; a memory is kept for
-# good, so the refusal says so.
+# good, so the refusal says so. Learned corrections (including forgetting one)
+# rewrite every future transcript, so they are gated the same way.
 #
-# These three, and ONLY these three, are gated on the GENERATION rather than
+# These, and ONLY these, are gated on the GENERATION rather than
 # the turn — see `_writer_untrusted_source`. Held exhaustive against the tools
 # that actually call a `jarvis_memory` writer by
 # tests/test_memory_writers.py::test_every_tool_that_writes_memory_is_named_as_one.
-MEMORY_WRITERS = {"remember", "project_note", "write_journal"}
+# list_corrections only reads and stays ungated by design.
+MEMORY_WRITERS = {"remember", "project_note", "write_journal", "learn_correction", "forget_correction"}
 
 
 def _writer_untrusted_source(tool: str) -> str | None:
@@ -5347,7 +5798,7 @@ REPO_SENSITIVE_REFUSAL = ("That's a private file, sir — credentials and keys "
 # Containment and the sensitive-file wall are unchanged and get this for
 # free — every path still goes through `repo_read.resolve_within`, so
 # JARVIS's own `.env` is refused exactly as any other project's is. That is
-# not incidental: his .env holds the Fish API key.
+# not incidental: his .env holds the user's own settings.
 
 JARVIS_SELF_NAME = "JARVIS"
 
@@ -6305,15 +6756,54 @@ def tool_write_journal(args: dict) -> str:
     return "Journal written."
 
 
+def tool_learn_correction(args: dict) -> str:
+    """Teach one mis-hearing: from now on `heard` is understood as `meant`.
+
+    For the user's own corrections only ("you heard X, I said Y") — learned
+    pairs rewrite every future transcript, so a planted one would corrupt
+    hearing itself. Hence ACTING and MEMORY_WRITER: refused on tainted turns
+    like `remember`.
+    """
+    refusal = learn_correction(str(args.get("heard") or ""),
+                               str(args.get("meant") or ""),
+                               turn_lang)
+    if refusal:
+        return refusal
+    return "Noted, sir — I'll hear those words correctly from now on."
+
+
+def tool_forget_correction(args: dict) -> str:
+    """Undo one teaching. A writer (deletes profile state) so MEMORY_WRITER-gated like learn."""
+    heard = str(args.get("heard") or "").strip()
+    if not heard:
+        return "Tell me which hearing to forget, sir."
+    if forget_correction(heard):
+        return f"Forgotten, sir — '{heard}' no longer rewrites anything."
+    return f"I have no correction for '{heard}', sir."
+
+
+def tool_list_corrections(args: dict) -> str:
+    """List taught pairs. Read-only, never gated."""
+    rows = list_corrections()
+    if not rows:
+        return "No corrections taught yet, sir."
+    return "; ".join(f"'{r['heard']}' → '{r['meant']}'" for r in rows)
+
+
 TOOL_HANDLERS.update({
     "remember": tool_remember,
     "recall": tool_recall,
     "project_note": tool_project_note,
     "write_journal": tool_write_journal,
+    "learn_correction": tool_learn_correction,
+    "forget_correction": tool_forget_correction,
+    "list_corrections": tool_list_corrections,
 })
-# These three WRITE. A watcher-origin turn must never reach them, or text from
+# These WRITE. A watcher-origin turn must never reach them, or text from
 # somebody else's transcript could plant a "fact" JARVIS then repeats as his own.
-ACTING_TOOLS.update({"remember", "project_note", "write_journal"})
+# forget_correction deletes profile state (a write) so it is gated too;
+# list_corrections only reads and stays ungated.
+ACTING_TOOLS.update({"remember", "project_note", "write_journal", "learn_correction", "forget_correction"})
 
 
 @app.websocket("/ws/sessions")
@@ -6567,6 +7057,33 @@ def _scan_projects_sync() -> list[dict]:
 
 # -- WebSocket Voice Handler -----------------------------------------------
 
+def _gemini_provider() -> str:
+    """STT provider flag. Default webspeech; gemini enables Live session."""
+    try:
+        import gemini_live
+        return gemini_live.provider()
+    except Exception:
+        import os as _os
+        return (_os.getenv("JARVIS_STT_PROVIDER", "webspeech") or "webspeech").lower()
+
+
+_gemini_sessions: dict = {}
+
+
+async def _handle_gemini_transcript(text: str, is_final: bool) -> None:
+    """Gemini Live transcript into the existing turn pipeline (no lang tag)."""
+    if speech is None or not text or not is_final:
+        return
+    lang = detect_lang(text)
+    fixed = apply_speech_corrections(text.strip(), lang)
+    if not fixed:
+        return
+    verdict = await speech.user_final(fixed)
+    if verdict != "speech":
+        return
+    _spawn(_handle_utterance(fixed, lang))
+
+
 @app.websocket("/ws/voice")
 async def voice_handler(ws: WebSocket):
     """
@@ -6597,13 +7114,44 @@ async def voice_handler(ws: WebSocket):
         _enqueue(queue, {"type": "config", "muteMicDuringSpeech": MUTE_MIC_DURING_SPEECH})
         _enqueue(queue, {"type": "status", "state": "idle"})
 
+        live = None
+        if _gemini_provider() == "gemini":
+            try:
+                import gemini_live as _gl
+                import base64 as _b64
+
+                def _on_audio(pcm: bytes, _q=queue):
+                    _enqueue(_q, {"type": "live_audio",
+                                  "data": _b64.b64encode(bytes(pcm)).decode()})
+
+                def _on_transcript(tr, _ws=ws):
+                    _spawn(_handle_gemini_transcript(tr.text, tr.is_final))
+
+                live = _gl.GeminiLiveSession(on_transcript=_on_transcript,
+                                             on_audio=_on_audio)
+                await live.connect()
+                _gemini_sessions[id(ws)] = live
+            except Exception as e:
+                log.warning(f"gemini live unavailable, webspeech continues: {e}")
+                live = None
+
         global _last_greeting_time
         if speech is not None and time.time() - _last_greeting_time > 60:
             _last_greeting_time = time.time()
             await speech.say(_greeting(), Priority.NORMAL)
 
         while True:
-            raw = await ws.receive_text()
+            frame = await ws.receive()
+            if "bytes" in frame and frame["bytes"] is not None:
+                if live is not None:
+                    try:
+                        await live.send_pcm(bytes(frame["bytes"]))
+                    except Exception as e:
+                        log.warning(f"live pcm send failed: {e}")
+                continue
+            raw = frame.get("text")
+            if raw is None:
+                continue
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
@@ -6652,7 +7200,8 @@ async def voice_handler(ws: WebSocket):
                 except (KeyError, TypeError, ValueError, OverflowError):
                     pass
             elif kind == "transcript" and msg.get("isFinal"):
-                text = apply_speech_corrections(str(msg.get("text", "")).strip())
+                lang = _resolve_transcript_lang(msg.get("lang"))
+                text = apply_speech_corrections(str(msg.get("text", "")).strip(), lang)
                 if not text:
                     continue
                 verdict = await speech.user_final(text)
@@ -6679,13 +7228,19 @@ async def voice_handler(ws: WebSocket):
                 if _is_fresh_start(text):
                     _spawn(_start_fresh())
                     continue
-                _spawn(_handle_utterance(text))
+                _spawn(_handle_utterance(text, lang))
     except WebSocketDisconnect:
         log.info("Voice WebSocket disconnected")
     except Exception as e:
         log.error(f"WebSocket error: {e}", exc_info=True)
     finally:
         _drop_voice_client(ws)
+        live = _gemini_sessions.pop(id(ws), None)
+        if live is not None:
+            try:
+                await live.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -6701,7 +7256,7 @@ async def voice_handler(ws: WebSocket):
 # endpoint that can replace JARVIS's brain with /tmp/evil and then ask for
 # a restart.
 SETTABLE_ENV_KEYS = frozenset({
-    "FISH_API_KEY", "FISH_VOICE_ID", "USER_NAME", "HONORIFIC",
+    "USER_NAME", "HONORIFIC",
 })
 
 # A value may not carry anything that ends the line it is written on.
@@ -6726,7 +7281,7 @@ SETTABLE_ENV_KEYS = frozenset({
 # through `.env`, and into the brain — a paragraph of somebody's choosing
 # standing in the system prompt as JARVIS's own words.
 #
-# So two bounds, because the keys are two kinds of thing. A Fish Audio key is
+# So two bounds, because the keys are two kinds of thing. A stored value is
 # an opaque token and needs room; a NAME is a name. Neither needs a thousand
 # characters, and the name — the one that reaches the prompt — gets the
 # tighter one. Held against SETTABLE_ENV_KEYS itself by tests/test_bounds.py,
@@ -6836,6 +7391,7 @@ class KeyUpdate(BaseModel):
 class KeyTest(BaseModel):
     key_value: str | None = None
 
+
 class PreferencesUpdate(BaseModel):
     user_name: str = ""
     honorific: str = "sir"
@@ -6848,40 +7404,60 @@ async def api_settings_keys(body: KeyUpdate):
         return JSONResponse({"success": False, "error": str(e)}, status_code=400)
     return {"success": True}
 
-@app.post("/api/settings/test-fish")
-async def api_test_fish(body: KeyTest):
-    key = body.key_value or os.getenv("FISH_API_KEY", "")
-    if not key:
-        return {"valid": False, "error": "No key provided"}
+@app.post("/api/settings/test-edge-tts")
+async def api_test_edge_tts(body: KeyTest):
+    """Test Edge TTS connectivity. No API key needed — just verifies the
+    edge_tts package is installed and can reach Microsoft's service."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                "https://api.fish.audio/v1/tts",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"text": "test", "reference_id": FISH_VOICE_ID},
-            )
-            if resp.status_code in (200, 201):
-                return {"valid": True}
-            elif resp.status_code == 401:
-                return {"valid": False, "error": "Invalid API key"}
-            else:
-                return {"valid": False, "error": f"HTTP {resp.status_code}"}
+        import edge_tts  # noqa: F401
+    except ImportError:
+        return {"valid": False, "error": "edge_tts is not installed. Run: pip install edge-tts"}
+
+    try:
+        # Quick connectivity test with a short text
+        communicate = edge_tts.Communicate("Hello", "en-US-GuyNeural")
+        chunks = []
+        async for chunk in communicate.stream():
+            if chunk.get("type") == "audio":
+                blob = chunk.get("data", chunk.get("bytes"))
+                if blob:
+                    chunks.append(blob)
+        if chunks:
+            return {"valid": True, "message": "Edge TTS is working"}
+        else:
+            return {"valid": False, "error": "Edge TTS returned no audio"}
     except Exception as e:
         return {"valid": False, "error": str(e)[:200]}
+
+@app.post("/api/settings/test-fish")
+async def api_test_fish(body: KeyTest):
+    """Retired Fish Audio endpoint. Kept so older frontends fail loudly
+    instead of silently: Edge TTS needs no key — use /api/settings/test-edge-tts."""
+    return {"valid": False, "error": "Fish Audio is retired; JARVIS now uses Edge TTS (no key needed)."}
 
 @app.get("/api/settings/status")
 async def api_settings_status():
     import shutil as _shutil
     _, env_dict = _read_env()
-    claude_installed = _shutil.which("claude") is not None
+    cli_path = os.getenv("JARVIS_CLI_PATH") or os.getenv("JARVIS_CLAUDE_PATH") or "claude"
+    cli_binary = cli_path.split()[0]
+    cli_installed = _shutil.which(cli_binary) is not None
+    try:
+        import edge_tts  # noqa: F401
+        edge_tts_ok = True
+    except ImportError:
+        edge_tts_ok = False
     return {
-        "claude_code_installed": claude_installed,
+        "claude_code_installed": cli_installed,
+        "cli_backend": "hermes" if "hermes" in cli_binary else "claude",
         "server_port": 8340,
         "uptime_seconds": int(time.time() - _session_start),
         "env_keys_set": {
-            "fish_audio": bool(env_dict.get("FISH_API_KEY", "").strip() and env_dict.get("FISH_API_KEY", "") != "your-fish-audio-api-key-here"),
-            "fish_voice_id": bool(env_dict.get("FISH_VOICE_ID", "").strip()),
+            "fish_audio": False,
+            "fish_voice_id": False,
+            "edge_tts": edge_tts_ok,
             "user_name": env_dict.get("USER_NAME", ""),
+            "preferred_lang": _read_profile().get("preferred_lang", "en"),
         },
     }
 

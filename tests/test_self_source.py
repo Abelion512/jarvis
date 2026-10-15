@@ -119,12 +119,12 @@ async def test_he_can_read_his_own_source(ready):
 
 @pytest.mark.asyncio
 async def test_his_own_env_is_as_private_as_anybody_elses(ready):
-    """His .env holds the Fish Audio key. The wall is `repo_read`'s, reused
-    rather than rewritten — this test proves it is actually in the path."""
+    """His .env holds the user's own settings. The wall is `repo_read`'s,
+    reused rather than rewritten — this test proves it is actually in the path."""
     server = ready
     answer = await server.tool_read_file({"project": "jarvis", "path": ".env"})
     assert answer == server.REPO_SENSITIVE_REFUSAL
-    assert "API_KEY" not in answer and "FISH" not in answer
+    assert "API_KEY" not in answer
 
 
 @pytest.mark.asyncio
@@ -136,7 +136,7 @@ async def test_the_refusal_is_not_simply_everything_failing(ready):
     answer = await server.tool_read_file({"project": "jarvis",
                                           "path": ".env.example"})
     assert answer != server.REPO_SENSITIVE_REFUSAL
-    assert "FISH_API_KEY" in answer, "the documented template should read fine"
+    assert "JARVIS_CLI_PATH" in answer, "the documented template should read fine"
 
 
 @pytest.mark.asyncio

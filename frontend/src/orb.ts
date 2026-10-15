@@ -8,6 +8,12 @@
 
 import * as THREE from "three";
 
+// ponytail: hoisted — the animate loop allocated 2 Colors per frame (120/s GC churn).
+const COL_THINK = new THREE.Color(0x6ec4ff);
+const COL_SPEAK = new THREE.Color(0x5ab8f0);
+const COL_COMPACT = new THREE.Color(0x3a5f8a);
+const COL_IDLE = new THREE.Color(0x4ca8e8);
+
 // "compacting": the brain is being swapped for a fresh one behind the scenes
 // (a context rotation). He answers nothing for a few seconds, and silence with
 // no explanation reads as a crash. It used to be followed by a spoken line;
@@ -122,12 +128,13 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
   let freqData = new Uint8Array(64);
   let bass = 0, mid = 0;
 
-  const clock = new THREE.Clock();
+  const timer = new THREE.Timer();
 
   function animate() {
     if (destroyed) return;
     requestAnimationFrame(animate);
-    const t = clock.getElapsedTime();
+    timer.update();
+    const t = timer.getElapsed();
 
     switch (state) {
       case "idle":
@@ -234,7 +241,9 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
       let lineCount = 0;
       const maxDist = lineDistance * (1 + bass * 0.5);
       const maxDistSq = maxDist * maxDist;
-      const step = Math.max(1, Math.floor(N / 600));
+      // ponytail: 667 sampled points = ~222k checks/frame (~13ms, blows the
+      // 16ms frame budget). 250 sampled = ~31k checks/frame (~2ms), same look.
+      const step = Math.max(1, Math.floor(N / 250));
 
       for (let i = 0; i < N && lineCount < MAX_LINES; i += step) {
         const i3 = i * 3;
@@ -313,10 +322,10 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
     mat.opacity = currentBright + bass * 0.08;
     mat.size = currentSize + bass * 0.05;
 
-    if (state === "thinking") { mat.color.lerp(new THREE.Color(0x6ec4ff), 0.015); lineMat.color.lerp(new THREE.Color(0x6ec4ff), 0.015); }
-    else if (state === "speaking") { mat.color.lerp(new THREE.Color(0x5ab8f0), 0.015); lineMat.color.lerp(new THREE.Color(0x5ab8f0), 0.015); }
-    else if (state === "compacting") { mat.color.lerp(new THREE.Color(0x3a5f8a), 0.03); lineMat.color.lerp(new THREE.Color(0x3a5f8a), 0.03); }   // desaturated, cooler
-    else { mat.color.lerp(new THREE.Color(0x4ca8e8), 0.015); lineMat.color.lerp(new THREE.Color(0x4ca8e8), 0.015); }
+    if (state === "thinking") { mat.color.lerp(COL_THINK, 0.015); lineMat.color.lerp(COL_THINK, 0.015); }
+    else if (state === "speaking") { mat.color.lerp(COL_SPEAK, 0.015); lineMat.color.lerp(COL_SPEAK, 0.015); }
+    else if (state === "compacting") { mat.color.lerp(COL_COMPACT, 0.03); lineMat.color.lerp(COL_COMPACT, 0.03); }   // desaturated, cooler
+    else { mat.color.lerp(COL_IDLE, 0.015); lineMat.color.lerp(COL_IDLE, 0.015); }
 
     camera.position.x = Math.sin(t * 0.02) * 5;
     camera.position.y = Math.cos(t * 0.03) * 3;

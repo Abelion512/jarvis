@@ -1613,3 +1613,29 @@ async def test_the_quiet_room_bar_returns_once_his_audio_has_ended(h):
     await h.ack_all()
     await asyncio.sleep(0.05)
     assert not s.is_speaking
+
+
+# --- Chinese turns must reach the brain, not die as "echo" ------------------
+#
+# `_tokens` used to be Latin-only, so a pure-Chinese transcript tokenized to
+# `[]` and `classify` returned "echo" for empty input — every Chinese turn
+# was dropped before the brain. CJK runs tokenize whole (not per character:
+# single Han characters collide across unrelated sentences, which would turn
+# every turn into an echo of the last).
+
+def test_a_chinese_sentence_after_a_different_one_is_speech():
+    s, t = _scheduler_with_clock()
+    _he_just_said(s, t, "构建已经完成了先生", acked_ago=1.5)
+    assert s.classify("天气怎么样") == "speech"
+
+
+def test_his_own_chinese_sentence_coming_back_is_an_echo():
+    s, t = _scheduler_with_clock()
+    _he_just_said(s, t, "构建已经完成了先生", acked_ago=3.0)
+    assert s.classify("构建已经完成了先生") == "echo"
+
+
+def test_chinese_replay_request_is_a_replay():
+    s, t = _scheduler_with_clock()
+    assert s.classify("再说一遍") == "replay"
+    assert s.classify("再讲一遍") == "replay"

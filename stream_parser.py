@@ -1,5 +1,10 @@
 """Pure parsing of `claude -p --output-format stream-json` output.
 
+Hermes Agent's `chat --format stream-json` uses the same `type` vocabulary
+for the events JARVIS reads (`system`/`init`, `result`) with a narrower
+payload (`text`, `tokens`, `exit_code`), which the extractors below
+normalize — so the run pipeline is unchanged.
+
 No I/O. Everything here is driven by recorded fixtures in tests, which is
 what lets the executor be tested without spawning a process.
 
@@ -55,15 +60,31 @@ def extract_result_metrics(event: dict) -> dict:
     if not isinstance(usage, dict):
         usage = {}
     result = event.get("result")
+    if not isinstance(result, str):
+        # Hermes Agent's one-shot shape: text + tokens + exit_code.
+        text = event.get("text")
+        result = text if isinstance(text, str) else ""
+        toks = event.get("tokens")
+        if isinstance(toks, dict) and not usage:
+            usage = {
+                "input_tokens": toks.get("input", 0),
+                "output_tokens": toks.get("output", 0),
+            }
+    is_error = bool(event.get("is_error"))
+    if not is_error and isinstance(event.get("exit_code"), int):
+        is_error = event["exit_code"] != 0
+    if not is_error and event.get("error"):
+        is_error = True
     return {
         "cost_usd": _as_float(event.get("total_cost_usd"), 0.0),
         "input_tokens": _as_int(usage.get("input_tokens"), 0),
         "output_tokens": _as_int(usage.get("output_tokens"), 0),
         "cache_read_tokens": _as_int(usage.get("cache_read_input_tokens"), 0),
-        "cache_creation_tokens": _as_int(usage.get("cache_creation_input_tokens"), 0),
+        "cache_creation_tokens": _as_int(
+            usage.get("cache_creation_input_tokens"), 0),
         "num_turns": _as_int(event.get("num_turns"), 0),
         "result_text": result if isinstance(result, str) else "",
-        "is_error": bool(event.get("is_error")),
+        "is_error": is_error,
     }
 
 

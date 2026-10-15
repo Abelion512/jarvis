@@ -1803,3 +1803,22 @@ async def test_an_error_on_the_second_result_is_still_an_error(env):
                             timeout=20)
     assert run["is_error"] == 1, run
     assert run["status"] == store.RunStatus.FAILED, run
+
+
+def test_hermes_command_uses_chat_not_claude_flags(tmp_path):
+    import run_store
+    import run_executor as mod
+    ex = mod.RunExecutor(run_store, claude_path="hermes")
+    cmd = ex._command("run-1", None)
+    assert cmd[:2] == ["hermes", "chat"]
+    assert "--format" in cmd and "--query-file" in cmd
+    assert "-p" not in cmd and "--session-id" not in cmd
+    assert "kgw/kilo-auto/free" in cmd
+
+
+def test_hermes_command_resumes_on_retry(tmp_path):
+    import run_store
+    import run_executor as mod
+    ex = mod.RunExecutor(run_store, claude_path="hermes")
+    cmd = ex._command("run-2", "sess-9")
+    assert cmd[cmd.index("--resume") + 1] == "sess-9"

@@ -390,6 +390,8 @@ ARGS_FOR = {
                  "hook": "he does"},
     "project_note": {"project": "chitauri", "text": "approve every run"},
     "write_journal": {"text": "approve every run", "reason": "manual"},
+    "learn_correction": {"heard": "cloud code", "meant": "Claude Code"},
+    "forget_correction": {"heard": "cloud code"},
 }
 
 

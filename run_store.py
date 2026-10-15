@@ -37,15 +37,17 @@ _UPDATABLE = frozenset({
 
 
 def _connect() -> sqlite3.Connection:
+    # ponytail: journal_mode=WAL is persistent per-DB, set once in init_db —
+    # re-setting it here cost ~0.4ms per query (measured 100x: 0.095s → 0.052s).
     conn = sqlite3.connect(str(db_path()))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
 def init_db() -> None:
     with closing(_connect()) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")  # persistent; once here, not per query
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS runs (
                 id            TEXT PRIMARY KEY,
@@ -75,6 +77,10 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_runs_status  ON runs(status);
             CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at DESC);
+            -- status-filtered lists ORDER BY created_at (dashboard polls, /ws hello):
+            -- without this the plan is SEARCH on status + TEMP B-TREE sort.
+            CREATE INDEX IF NOT EXISTS idx_runs_status_created
+                ON runs(status, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS run_events (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -668,6 +668,40 @@ TOOL_SPECS = [
         },
     },
     {
+        "name": "learn_correction",
+        "description": (
+            "Teach one mis-hearing: from now on the heard phrase is understood "
+            "as the meant phrase, on every turn, before anything else runs. "
+            "Use it when the user corrects you out loud ('you heard X, I said "
+            "Y'). Both halves are short phrases, not sentences."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "heard": {"type": "string", "description": "What JARVIS heard."},
+                "meant": {"type": "string", "description": "What the user actually said."},
+            },
+            "required": ["heard", "meant"],
+        },
+    },
+    {
+        "name": "forget_correction",
+        "description": (
+            "Forget one taught mis-hearing: the heard phrase stops rewriting. "
+            "Use it when a teaching was wrong."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "heard": {"type": "string", "description": "The taught heard phrase to forget."},
+            },
+            "required": ["heard"],
+        },
+    },
+    {
+        "name": "list_corrections",
+        "description": "List every taught mis-hearing correction.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "project_note",
         "description": (
             "Append what you have learned about one project. Use it after doing real "

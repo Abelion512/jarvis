@@ -69,6 +69,7 @@ def test_command_has_exact_flags(tmp_path):
         "mcp__jarvis__repo_overview,mcp__jarvis__search_repo,"
         "mcp__jarvis__read_file,mcp__jarvis__open_in_editor,"
         "mcp__jarvis__remember,mcp__jarvis__recall,"
+        "mcp__jarvis__learn_correction,"
         "mcp__jarvis__project_note,mcp__jarvis__write_journal,"
         # The CLI's own two, and the only built-ins here: without them JARVIS
         # can read a page he was given the address of and find nothing.
@@ -84,6 +85,11 @@ def test_command_has_exact_flags(tmp_path):
 
 def test_model_defaults_to_sonnet_and_env_overrides(tmp_path, monkeypatch):
     import brain
+    # Hermetic: a TestClient portal thread in an earlier test may still be
+    # importing server (whose .env setdefault writes process os.environ).
+    monkeypatch.delenv("JARVIS_CLI_PATH", raising=False)
+    monkeypatch.delenv("JARVIS_CLAUDE_PATH", raising=False)
+    monkeypatch.delenv("JARVIS_BRAIN_MODEL", raising=False)
     assert brain.BrainConfig.from_env(tmp_path).model == "sonnet"
     monkeypatch.setenv("JARVIS_BRAIN_MODEL", "haiku")
     assert brain.BrainConfig.from_env(tmp_path).model == "haiku"
@@ -485,10 +491,10 @@ def test_child_env_never_carries_api_credentials(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example")   # would move the brain off the login
     monkeypatch.setenv("ANTHROPIC_MODEL", "something")
-    monkeypatch.setenv("FISH_API_KEY", "keep")
+    monkeypatch.setenv("USER_NAME", "keep")
     env = brain.Brain.child_env()
     assert not any(k.startswith("ANTHROPIC_") for k in env)
-    assert env["FISH_API_KEY"] == "keep"
+    assert env["USER_NAME"] == "keep"
 
 
 @pytest.mark.asyncio
@@ -1010,3 +1016,220 @@ async def test_invalid_utf8_line_does_not_kill_the_reader(tmp_path, caplog):
         # this the child outlives the test, keeps pytest's captured stdout,
         # and the suite hangs instead of reporting the failure.
         await _bounded(b.stop(), 20, b, "brain.stop()")
+
+
+# ── hermes backend: command shape + from_env defaults ─────────────────────
+
+def test_hermes_command_uses_chat_stream_json_not_claude_flags(tmp_path):
+    import brain
+    cfg = _config(tmp_path, cli_path="hermes", model="kgw/kilo-auto/free")
+    b = brain.Brain(cfg)
+    assert b.is_hermes
+    cmd = b.command()
+    assert cmd[:2] == ["hermes", "chat"]
+    assert "--format" in cmd and cmd[cmd.index("--format") + 1] == "stream-json"
+    assert cmd[cmd.index("-m") + 1] == "kgw/kilo-auto/free"
+    assert "--query-file" in cmd
+    for flag in ("-p", "--input-format", "--output-format", "--tools",
+                 "--mcp-config", "--append-system-prompt",
+                 "--dangerously-skip-permissions"):
+        assert flag not in cmd
+
+
+def test_hermes_command_resumes_the_session(tmp_path):
+    import brain
+    b = brain.Brain(_config(tmp_path, cli_path="hermes"))
+    b.session_id = "abc123"
+    cmd = b.command()
+    assert cmd[cmd.index("--resume") + 1] == "abc123"
+
+
+def test_claude_command_is_unchanged_by_default(tmp_path):
+    import brain
+    b = brain.Brain(_config(tmp_path))
+    assert not b.is_hermes
+    assert "-p" in b.command()
+
+
+def test_from_env_hermes_defaults_to_kilo_free(tmp_path, monkeypatch):
+    import brain
+    monkeypatch.setenv("JARVIS_CLI_PATH", "hermes")
+    monkeypatch.delenv("JARVIS_BRAIN_MODEL", raising=False)
+    cfg = brain.BrainConfig.from_env(tmp_path)
+    assert cfg.model == "kgw/kilo-auto/free"
+
+
+def test_from_env_claude_defaults_to_sonnet(tmp_path, monkeypatch):
+    import brain
+    monkeypatch.delenv("JARVIS_CLI_PATH", raising=False)
+    monkeypatch.delenv("JARVIS_CLAUDE_PATH", raising=False)
+    monkeypatch.delenv("JARVIS_BRAIN_MODEL", raising=False)
+    cfg = brain.BrainConfig.from_env(tmp_path)
+    assert cfg.model == "sonnet"
+
+
+# ── hermes backend: per-turn subprocess against the fake ─────────────────
+
+FAKE_HERMES = Path(__file__).parent / "fixtures" / "fake_hermes.py"
+
+
+def _hermes_config(tmp_path, **kw):
+    import brain
+    return brain.BrainConfig(home=tmp_path / "jarvis",
+                             cli_path=f"{sys.executable} {FAKE_HERMES}",
+                             model="kgw/kilo-auto/free",
+                             turn_timeout=kw.pop("turn_timeout", 10.0),
+                             warmup_timeout=kw.pop("warmup_timeout", 10.0),
+                             **kw)
+
+
+@pytest.mark.asyncio
+async def test_hermes_start_and_turn_through_fake(tmp_path):
+    import brain
+    b = brain.Brain(_hermes_config(tmp_path))
+    assert await b.start()
+    assert b.ready and b.session_id
+    try:
+        r = await b.turn("hello there")
+        assert r.stop_reason == "result", r
+        assert r.text == "Echo: hello there"
+        assert r.context_tokens > 0
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_hermes_turn_resumes_the_session(tmp_path):
+    import brain
+    b = brain.Brain(_hermes_config(tmp_path))
+    assert await b.start()
+    try:
+        first = b.session_id
+        r = await b.turn("second turn")
+        assert r.stop_reason == "result"
+        assert b.session_id == first  # resumed, not a fresh session
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_hermes_error_turn_is_an_error(tmp_path):
+    import brain
+    b = brain.Brain(_hermes_config(tmp_path))
+    assert await b.start()
+    try:
+        r = await b.turn("HERMESERROR please")
+        assert r.stop_reason == "error" and r.text == ""
+        assert "401" in (r.error or "")
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_hermes_streamed_fragments_are_not_duplicated(tmp_path):
+    """fake_hermes emits two `text` fragments plus a `result` repeating them
+    verbatim. The fragments must join to exactly result.text — taking the
+    result on top of the fragments would speak everything twice."""
+    import brain
+    b = brain.Brain(_hermes_config(tmp_path))
+    assert await b.start()
+    try:
+        deltas = []
+        r = await b.turn("hello there", on_delta=deltas.append)
+        assert r.stop_reason == "result", r
+        assert deltas, "fake_hermes streams text fragments"
+        assert "".join(deltas) == r.text == "Echo: hello there"
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_hermes_turn_sets_origin_and_taint(tmp_path):
+    """Blockers #2/#3: without _inflight, current_origin is None (acting
+    tools refused) and web tool use never taints (acting tools allowed on
+    poisoned turns)."""
+    import brain
+    b = brain.Brain(_hermes_config(tmp_path))
+    assert await b.start()
+    try:
+        seen_origins = []
+
+        def _hook(d):
+            seen_origins.append(b.current_origin)
+
+        r = await b.turn("HTOOL please", on_delta=_hook)
+        assert r.stop_reason == "result", r
+        assert "WebFetch" in r.tools
+        assert seen_origins and all(o == "user" for o in seen_origins)
+        assert b.turn_untrusted_source is None  # cleared with the turn, by design
+        # The tool_use landed mid-turn, so the generation carries the taint
+        # even though per-turn deltas fired before it arrived.
+        assert b.generation_untrusted_source == "a web page"
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_hermes_first_turn_carries_persona_not_just_prompt(tmp_path, monkeypatch):
+    """Blocker #5: with no resumed session the stdin payload must include
+    the launch context, or the Hermes brain starts with no persona."""
+    import brain
+    dump = tmp_path / "stdin.txt"
+    monkeypatch.setenv("FAKE_HERMES_DUMP_STDIN", str(dump))
+    b = brain.Brain(_hermes_config(tmp_path))
+    assert await b.start()
+    try:
+        payload = dump.read_text()
+        assert "System context" in payload
+        assert "(system) Warm-up" in payload
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_supersede_kills_stale_hermes_turn(tmp_path):
+    """Sidechat: a newer utterance replaces a still-running voice turn
+    instead of queueing behind it. The killed turn ends as `died`
+    (no result event), and the next turn proceeds normally."""
+    import asyncio
+    import time as _time
+    import brain
+    b = brain.Brain(_hermes_config(tmp_path, turn_timeout=20.0))
+    assert await b.start()
+    try:
+        t0 = _time.monotonic()
+        stale = asyncio.create_task(b.turn("SLOW:30 please"))
+        await asyncio.sleep(1.0)
+        assert b.supersede_turn() is True
+        r = await asyncio.wait_for(asyncio.shield(stale), timeout=15.0)
+        assert r.stop_reason == "died", r
+        assert _time.monotonic() - t0 < 15.0
+        assert b.supersede_turn() is False  # nothing in flight anymore
+        r2 = await b.turn("hello after")
+        assert r2.stop_reason == "result", r2
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_supersede_ignores_warmup_and_idle(tmp_path):
+    import brain
+    b = brain.Brain(_hermes_config(tmp_path))
+    assert b.supersede_turn() is False  # never started: no proc, no turn
+    assert await b.start()
+    try:
+        assert b.supersede_turn() is False  # warm-up (system origin) is not superseded
+    finally:
+        await b.stop()
+
+
+def test_hermes_default_budget_fits_small_window(tmp_path, monkeypatch):
+    import brain
+    monkeypatch.setenv("JARVIS_CLI_PATH", "hermes")
+    monkeypatch.delenv("JARVIS_BRAIN_CONTEXT_BUDGET", raising=False)
+    assert brain.BrainConfig.from_env(tmp_path).context_budget <= 36000
+    monkeypatch.delenv("JARVIS_CLI_PATH", raising=False)
+    monkeypatch.delenv("JARVIS_CLAUDE_PATH", raising=False)
+    assert brain.BrainConfig.from_env(tmp_path).context_budget == 120000
+    monkeypatch.setenv("JARVIS_BRAIN_CONTEXT_BUDGET", "5000")
+    assert brain.BrainConfig.from_env(tmp_path).context_budget == 5000

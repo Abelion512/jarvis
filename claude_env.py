@@ -24,6 +24,7 @@ import os
 
 # Every ANTHROPIC_* variable, not just the key: the base URL and the model
 # override redirect a child just as effectively as credentials do.
+# Applies to both `claude` and `hermes` children.
 SCRUBBED_ENV_PREFIXES = ("CLAUDE_CODE_", "ANTHROPIC_")
 SCRUBBED_ENV_KEYS = {"CLAUDECODE"}
 
@@ -44,13 +45,13 @@ SCRUBBED_ENV_KEYS = {"CLAUDECODE"}
 # results and large diffs, which top out in the low single-digit MiB) while
 # staying small enough that even a runaway line cannot balloon memory
 # unboundedly — pass this to every `create_subprocess_exec(..., limit=...)`
-# that reads a Claude Code child's stdout/stderr.
+# that reads a CLI child's stdout/stderr.
 STREAM_LINE_LIMIT = 64 * 1024 * 1024  # 64 MiB per line
 
 
 def child_env(base: dict[str, str] | None = None) -> dict[str, str]:
     """A copy of the environment with everything that would redirect or
-    re-bill a Claude Code child removed. Everything else — PATH, HOME,
+    re-bill a CLI child removed. Everything else — PATH, HOME,
     CLAUDE_CONFIG_DIR, the user's own variables — passes through untouched."""
     source = os.environ if base is None else base
     return {k: v for k, v in source.items()

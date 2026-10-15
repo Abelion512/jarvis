@@ -451,6 +451,19 @@ EXEMPT = {
         "the same: the `session_id` is the one the CLI just gave this "
         "process for itself, and it goes to `log.info`. A log is not the "
         "brain's context and is not spoken"),
+    "brain._start_hermes": (
+        "the same as `_spawn_locked` for the Hermes backend: the "
+        "`session_id` names this brain's own Hermes session, and it goes "
+        "to `log.info`, never to the model or to speech"),
+    "brain._turn_hermes": (
+        "the Hermes spelling of `_handle`: `session_id` and `model` are "
+        "the CLI's own fields for JARVIS's OWN turn, `text` is the "
+        "model's own output (the assistant delta by another name), and "
+        "`error` goes to a log line. Nothing here is another session's "
+        "or a page's words"),
+    "brain._read_all": (
+        "the stdout reader nested inside `_turn_hermes`; same argument — "
+        "it only sorts this turn's own events into state"),
     "brain.result": (
         "`origin` is one of this repository's own four literals (\"voice\", "
         "\"api\", \"system\", \"work\"), set by the caller that started the "
