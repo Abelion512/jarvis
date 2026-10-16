@@ -27,9 +27,6 @@ dist/
 .vite/
 frontend/.vite/
 
-# Generated reports and exports (test/e2e artifacts, not source)
-*.pptx
-
 # IDE / System
 .DS_Store
 .vscode/
