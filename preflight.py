@@ -25,32 +25,20 @@ per-call (the pattern `dialog.py` uses for `_osascript`).
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
-import re
 import shutil
 import sys
-import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import claude_env
 import screen
 
 log = logging.getLogger("jarvis.preflight")
 
-# CLAUDE.md: "2.1.224 or newer" -- cross-session messaging does not exist
-# below that. Compared as a tuple of ints, never as a string: "2.1.9" is
-# lexicographically GREATER than "2.1.224" (the naive, wrong comparison),
-# even though 9 < 224 as a version component.
-MIN_CLAUDE_VERSION = (2, 1, 224)
-MIN_CLAUDE_VERSION_STR = "2.1.224"
-
-# A hung subprocess (a wedged `claude`, a modal `osascript` is waiting on)
+# A hung subprocess (a wedged agent CLI, a modal `osascript` is waiting on)
 # must not stall server startup. Each check gets its own budget; they run
 # concurrently in run_checks() so the wall-clock cost is one timeout, not
 # the sum of them.
@@ -87,7 +75,7 @@ async def _run_subprocess(*args: str, timeout: float,
 
     `env=None` (the default) inherits this process's ambient environment,
     same as before. A caller that needs the subprocess to see a SPECIFIC
-    environment -- e.g. `claude_login` checking under exactly the
+    environment -- e.g. `hermes_login` checking under exactly the
     environment the brain spawns with -- passes one explicitly.
 
     Never raises: a spawn failure or a timeout comes back as returncode -1
@@ -124,32 +112,24 @@ async def _run_subprocess(*args: str, timeout: float,
     )
 
 
-def _parse_version(text: str) -> Optional[tuple[int, int, int]]:
-    """Pull the first X.Y.Z out of e.g. '2.1.258 (Claude Code)'."""
-    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
-    if not m:
-        return None
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-
-
 # ── which agent CLI ────────────────────────────────────────────────────
+# Hermes-only: JARVIS_CLI_PATH names the binary (default `hermes`).
+# The legacy JARVIS_CLAUDE_PATH is still honoured as a path override.
 
 def _cli_backend() -> str:
-    """'hermes' when JARVIS_CLI_PATH names Hermes Agent, else 'claude'."""
-    raw = os.getenv("JARVIS_CLI_PATH") or os.getenv("JARVIS_CLAUDE_PATH") or "claude"
-    return "hermes" if "hermes" in Path(raw).name else "claude"
+    return "hermes"
 
 
 def _cli_binary() -> str:
     raw = os.getenv("JARVIS_CLI_PATH") or os.getenv("JARVIS_CLAUDE_PATH")
     if raw:
         return raw.split()[0]
-    return "hermes" if _cli_backend() == "hermes" else "claude"
+    return "hermes"
 
 
 async def _check_hermes_cli(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
-    """`hermes` is on PATH. No minimum version: unlike Claude Code, no
-    JARVIS feature depends on a version-gated Hermes flag."""
+    """`hermes` is on PATH. No minimum version: no JARVIS feature depends
+    on a version-gated Hermes flag."""
     binary = _cli_binary()
     resolved = shutil.which(binary) or (binary if Path(binary).exists() else None)
     if not resolved:
@@ -157,8 +137,7 @@ async def _check_hermes_cli(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
             name="hermes_cli",
             status=STATUS_FAIL,
             message="`hermes` is not on PATH.",
-            remedy="Install Hermes Agent and make sure it's on PATH, "
-                   "or unset JARVIS_CLI_PATH to use Claude Code.",
+            remedy="Install Hermes Agent and make sure it's on PATH.",
         )
     rc, stdout, stderr = await _run_subprocess(resolved, "--version", timeout=timeout)
     if rc != 0:
@@ -208,210 +187,6 @@ async def _check_hermes_login(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
         )
     return Check(name="hermes_login", status=STATUS_OK,
                  message="Hermes provider answered.")
-
-
-# ── individual checks ────────────────────────────────────────────────────
-
-async def _check_claude_cli(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
-    """`claude` is on PATH and is at least MIN_CLAUDE_VERSION."""
-    claude = shutil.which("claude")
-    if not claude:
-        return Check(
-            name="claude_cli",
-            status=STATUS_FAIL,
-            message="`claude` is not on PATH.",
-            remedy=(
-                "Install Claude Code (npm install -g @anthropic-ai/claude-code, "
-                f"{MIN_CLAUDE_VERSION_STR} or newer) and make sure it's on PATH."
-            ),
-        )
-
-    rc, stdout, stderr = await _run_subprocess(claude, "--version", timeout=timeout)
-    if rc != 0:
-        return Check(
-            name="claude_cli",
-            status=STATUS_WARN,
-            message=f"`claude --version` failed: {(stderr or stdout).strip() or f'exit {rc}'}",
-            remedy="Run `claude --version` yourself to see what's wrong.",
-        )
-
-    version = _parse_version(stdout) or _parse_version(stderr)
-    if version is None:
-        return Check(
-            name="claude_cli",
-            status=STATUS_WARN,
-            message=f"Could not parse a version from `claude --version` output: {stdout.strip()!r}",
-            remedy=f"Run `claude --version` yourself and confirm it's {MIN_CLAUDE_VERSION_STR} or newer.",
-        )
-
-    version_str = ".".join(str(p) for p in version)
-    if version < MIN_CLAUDE_VERSION:
-        return Check(
-            name="claude_cli",
-            status=STATUS_FAIL,
-            message=f"claude {version_str} is older than the required {MIN_CLAUDE_VERSION_STR}.",
-            remedy="Update Claude Code: npm install -g @anthropic-ai/claude-code@latest",
-        )
-
-    return Check(name="claude_cli", status=STATUS_OK, message=f"claude {version_str} on PATH.")
-
-
-def _config_dir_from_env(env: dict[str, str]) -> Path:
-    """Where `claude` reads its config from, under `env` -- honours
-    CLAUDE_CONFIG_DIR exactly like the CLI does, falling back to its
-    default of ~/.claude. Mirrors `_settings_path()`, but takes an
-    explicit env dict rather than reading `os.environ` directly, so a
-    caller can point it at the SAME environment a subprocess was run
-    under instead of whatever this process's ambient environment is."""
-    root = env.get("CLAUDE_CONFIG_DIR") or "~/.claude"
-    return Path(root).expanduser()
-
-
-def _keychain_service_name(config_dir: Path) -> str:
-    """The macOS Keychain service name `claude` stores OAuth credentials
-    under for a given config dir.
-
-    Reverse-engineered empirically against a real install (not documented
-    by the CLI): the default config dir (~/.claude) uses the plain service
-    name "Claude Code-credentials"; any other CLAUDE_CONFIG_DIR gets an
-    8-hex-char suffix that is the start of sha256(str(config_dir)) --
-    verified against a live ~/.claude-orcha install. If a future CLI
-    version changes this scheme, the keychain lookup below simply finds no
-    matching entry, and the caller treats that as "cannot verify" rather
-    than reporting a wrong answer -- this function is a best-effort second
-    signal, never the sole basis for a result.
-    """
-    default = Path("~/.claude").expanduser()
-    if config_dir == default:
-        return "Claude Code-credentials"
-    digest = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
-    return f"Claude Code-credentials-{digest}"
-
-
-async def _read_oauth_refresh_expiry(config_dir: Path, timeout: float) -> Optional[float]:
-    """Best-effort read of the OAuth refresh token's expiry (unix seconds)
-    from the macOS Keychain, for `config_dir` -- WITHOUT ever surfacing the
-    access or refresh token values themselves, only the expiry timestamp.
-
-    This is what actually distinguishes "logged in" from "logged in but
-    the session cannot be refreshed": `claude auth status` reports only
-    presence, and on a live machine was seen reporting a session as logged
-    in that a real turn then failed to authenticate with. The CLI decides
-    whether a refresh will succeed from this same stored
-    `refreshTokenExpiresAt`, so reading it is the most faithful non-invasive
-    signal available -- short of spending a real turn, which this module
-    must not do.
-
-    Returns None -- "unknown", never "not expired" -- when the probe can't
-    be attempted or trusted: not macOS, `security` missing, no matching
-    keychain entry, or output that doesn't parse the way expected. Callers
-    must not treat None as a clean bill of health.
-    """
-    if sys.platform != "darwin" or not shutil.which("security"):
-        return None
-    service = _keychain_service_name(config_dir)
-    rc, stdout, _stderr = await _run_subprocess(
-        "security", "find-generic-password", "-s", service, "-w", timeout=timeout)
-    if rc != 0 or not stdout.strip():
-        return None
-    try:
-        data = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    oauth = data.get("claudeAiOauth")
-    if not isinstance(oauth, dict):
-        return None
-    expires_at_ms = oauth.get("refreshTokenExpiresAt")
-    if not isinstance(expires_at_ms, (int, float)):
-        return None
-    return expires_at_ms / 1000.0
-
-
-async def _check_claude_login(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
-    """The voice brain runs on the user's subscription -- `claude` must be
-    logged in, AND that login must actually be usable.
-
-    Runs `claude auth status` under exactly `claude_env.child_env()` -- the
-    same environment brain.py and run_executor.py spawn `claude` with --
-    rather than whatever happened to be in this process's ambient
-    environment, so a mismatched CLAUDE_CONFIG_DIR can't make this check
-    pass while the brain itself fails to authenticate. The config dir in
-    play is always named in the result so a mismatch is visible at a
-    glance.
-
-    `loggedIn: true` alone is not enough: a real incident on this project
-    had `claude auth status` report a session as logged in that then
-    failed every turn with "OAuth session expired and could not be
-    refreshed". When the account uses OAuth (authMethod "claude.ai"), this
-    also reads the stored refresh token's expiry from the Keychain (see
-    `_read_oauth_refresh_expiry`) and fails the check if it has already
-    passed. When that secondary probe can't be attempted or trusted, the
-    check stays OK (matching prior behaviour) but says so honestly rather
-    than implying a guarantee it cannot make.
-    """
-    claude = shutil.which("claude")
-    if not claude:
-        return Check(
-            name="claude_login",
-            status=STATUS_WARN,
-            message="Can't check login: `claude` is not on PATH.",
-            remedy="Install Claude Code and log in with `claude`.",
-        )
-
-    env = claude_env.child_env()
-    config_dir = _config_dir_from_env(env)
-    where = f"config dir: {config_dir}"
-
-    rc, stdout, stderr = await _run_subprocess(claude, "auth", "status", timeout=timeout, env=env)
-    if rc != 0:
-        return Check(
-            name="claude_login",
-            status=STATUS_FAIL,
-            message=f"`claude auth status` failed ({where}): {(stderr or stdout).strip() or f'exit {rc}'}",
-            remedy="Run `claude` and log in.",
-        )
-
-    try:
-        data = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError):
-        return Check(
-            name="claude_login",
-            status=STATUS_WARN,
-            message=f"Could not parse `claude auth status` output ({where}): {stdout.strip()!r}",
-            remedy="Run `claude auth status` yourself to confirm you're logged in.",
-        )
-
-    if not data.get("loggedIn"):
-        return Check(
-            name="claude_login",
-            status=STATUS_FAIL,
-            message=f"Claude Code is not logged in ({where}).",
-            remedy="Run `claude` and log in -- the voice brain runs on your subscription, not an API key.",
-        )
-
-    email = data.get("email")
-    message = f"Logged in as {email} ({where})." if email else f"Logged in ({where})."
-
-    if data.get("authMethod") == "claude.ai":
-        expires_at = await _read_oauth_refresh_expiry(config_dir, timeout)
-        if expires_at is None:
-            message += (" Could not independently verify the OAuth session's refresh-token "
-                        "expiry from this process -- `claude auth status` alone can report "
-                        "\"logged in\" even when a real turn would fail to authenticate.")
-        elif expires_at <= time.time():
-            when = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
-            return Check(
-                name="claude_login",
-                status=STATUS_FAIL,
-                message=(f"Claude Code reports logged in ({where}), but its OAuth session's "
-                         f"refresh token expired on {when} and could not be refreshed -- this "
-                         "is the exact failure that silences the voice brain."),
-                remedy="Run `claude` in a terminal and log in again.",
-            )
-        else:
-            message += " OAuth refresh token is current."
-
-    return Check(name="claude_login", status=STATUS_OK, message=message)
 
 
 # macOS's own wording (and error code) for "Accessibility not granted" --
@@ -600,7 +375,7 @@ def _check_anthropic_key_leftover_sync() -> Check:
         ),
         remedy=(
             "Remove ANTHROPIC_* variables from .env -- JARVIS's voice brain runs "
-            "on your Claude subscription, not an API key."
+            "on your Hermes provider login, not an API key."
         ),
     )
 
@@ -749,16 +524,14 @@ def enable_cross_session_inbound() -> tuple[bool, str]:
 
 # ── running them all ─────────────────────────────────────────────────────
 
-_ASYNC_CHECKS = (_check_claude_cli, _check_claude_login, _check_accessibility)
+_ASYNC_CHECKS = (_check_hermes_cli, _check_hermes_login, _check_accessibility)
 _SYNC_CHECKS = (_check_edge_tts_connectivity_sync, _check_anthropic_key_leftover_sync,
                 _check_cross_session_inbound_sync, _check_screen_recording_sync)
 _REACHABILITY_CHECKS = (_check_edge_tts_reachability,)
 
 
 def _selected_async_checks() -> tuple:
-    """The CLI checks for the configured backend; the rest never vary."""
-    if _cli_backend() == "hermes":
-        return (_check_hermes_cli, _check_hermes_login, _check_accessibility)
+    """The agent-CLI checks plus the platform checks that never vary."""
     return _ASYNC_CHECKS
 
 
@@ -793,12 +566,12 @@ async def run_checks(*, timeout: float | None = None) -> list[Check]:
     Never raises. Safe to call at startup: the worst case is a handful of
     `warn` results after `timeout` seconds, not a hung or crashed server.
 
-    The default budget is backend-aware: Hermes Agent spends ~15-30s on
-    plugin/MCP init before answering anything, so a 5s budget false-fails
-    every Hermes check at boot.
+    Hermes Agent spends ~15-30s on plugin/MCP init before answering
+    anything, so the budget defaults to 30s — a 5s budget would false-fail
+    every check at boot.
     """
     if timeout is None:
-        timeout = 30.0 if _cli_backend() == "hermes" else DEFAULT_CHECK_TIMEOUT
+        timeout = 30.0
     tasks = [_run_one(fn, is_async=True, timeout=timeout) for fn in _selected_async_checks()]
     tasks += [_run_one(fn, is_async=False, timeout=timeout) for fn in _SYNC_CHECKS]
     tasks += [_run_one(fn, is_async=True, timeout=3.0) for fn in _REACHABILITY_CHECKS]
@@ -813,13 +586,11 @@ async def run_checks(*, timeout: float | None = None) -> list[Check]:
 # the specific failure (e.g. "isn't installed" vs. "needs updating").
 def _phrase_for(check: Check) -> str:
     name, msg = check.name, check.message
-    if name in ("claude_cli", "hermes_cli"):
+    if name == "hermes_cli":
         if "not on PATH" in msg:
             return "the agent CLI isn't installed"
-        if "older than" in msg:
-            return "Claude Code needs updating"
         return "the agent CLI's version couldn't be checked"
-    if name in ("claude_login", "hermes_login"):
+    if name == "hermes_login":
         if "not logged in" in msg or "failed" in msg:
             return "the agent isn't logged in"
         return "the agent's login couldn't be checked"

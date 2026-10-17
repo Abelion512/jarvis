@@ -65,7 +65,6 @@ from pydantic import BaseModel
 
 import actions
 import builds
-from work_mode import is_casual_question
 import preflight
 import project_maker
 import projects_view
@@ -1385,7 +1384,7 @@ async def _ask_for_journal(timeout: Optional[float] = None) -> Optional[str]:
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log.warning(f"journal request failed: {e}")
+        log.warning(f"journal request failed: {type(e).__name__}: {e}")
         return None
     # A turn that ended in an error, a timeout or a rate limit may still carry
     # text — the CLI's error string. That is not a handover, and it must not be
@@ -2098,7 +2097,9 @@ async def _handle_utterance(text: str, lang: str = "en") -> None:
         elif result.stop_reason in ("timeout", "died", "not_running"):
             await speech.say("I lost my train of thought, sir. Say that again?", Priority.NORMAL)
         elif not result.text.strip():
+            log.warning(f"empty voice turn dropped (stop={result.stop_reason} err={result.error})")
             await _voice_emit({"type": "status", "state": "idle"})
+            return
         log.info(f"JARVIS: {result.text.strip()[:300]}")
         # first_audio is only known once the scheduler has sent the first chunk;
         # wait for playback so the latency line is accurate rather than early.
@@ -7189,7 +7190,8 @@ async def voice_handler(ws: WebSocket):
                 # live and the recogniser is working, and that whatever went
                 # wrong happened after this point.
                 text = str(msg.get("text", ""))
-                log.info("mic-hears: %s", text[-70:])
+                lang = _normalize_lang(msg.get("lang"))
+                log.info("mic-hears [%s]: %s", lang, text[-70:])
                 await speech.user_interim(text)
             elif kind == "played":
                 try:
@@ -7566,9 +7568,12 @@ if __name__ == "__main__":
 
     print()
     print("  J.A.R.V.I.S. Server v0.1.0")
-    print(f"  WebSocket: {ws_proto}://{args.host}:{args.port}/ws/voice")
-    print(f"  REST API:  {proto}://{args.host}:{args.port}/api/")
-    print(f"  Dashboard: {proto}://{args.host}:{args.port}/dashboard")
+    dial = _tool_connect_host(args.host)
+    print(f"  WebSocket: {ws_proto}://{dial}:{args.port}/ws/voice")
+    print(f"  REST API:  {proto}://{dial}:{args.port}/api/")
+    print(f"  Dashboard: {proto}://{dial}:{args.port}/dashboard")
+    if dial != args.host:
+        print(f"  (bound to {args.host}; {dial} is the dialable address on this machine)")
     print()
     # The exposure warning is deliberately NOT printed here. It is printed
     # from `lifespan`, which runs whether the server was started by this
