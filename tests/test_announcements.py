@@ -108,6 +108,7 @@ async def test_announcing_with_no_speech_configured_does_not_raise(wired, monkey
     server = wired
     monkeypatch.setattr(server, "speech", None)
     await server._announce_needs_you(_event())      # must not raise
+    assert server.speech is None  # the no-speech path ran, not the normal one
 
 
 # ---------------------------------------------------------------------------

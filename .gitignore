@@ -47,10 +47,14 @@ context/
 # nobody else's business. Local by default: nothing under it is published.
 .agents/
 # Generated from those summaries, and it links into them. Same rule.
-AGENTS.md
 
 # Superpowers SDD scratch
 .superpowers/
+
+# A stray, never-completed clone of an unrelated project (tt-a1i/archify).
+# Not ours, referenced by nothing; ignored so it stops showing as an untracked
+# addition. Nothing in it is needed — delete it whenever convenient.
+archify/
 
 # <!-- orcha:managed:start v2 -->
 # Orcha session summaries — local-only by default. Contains prompt + output
@@ -62,4 +66,10 @@ AGENTS.md
 # <repo>/.claude/worktrees/<slug>/ when a `claude --bg` task needs to write.
 # Always local — never tracked in the parent repo.
 .claude/worktrees/
+.freebuff
+.remember
+
 # <!-- orcha:managed:end -->
+
+# Tools
+mcp.json
