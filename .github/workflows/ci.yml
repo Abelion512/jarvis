@@ -1,0 +1,384 @@
+name: CI
+
+# ─────────────────────────────────────────────────────────────────────
+# Orchestrator workflow. A single detect job classifies which areas a
+# commit touches, then conditionally calls lane-gated sub-workflows.
+# A final all-checks-pass gate aggregates results so branch protection
+# only needs to require one check.
+#
+# Sub-workflows are triggered via workflow_call only — they have no
+# push/pull_request triggers of their own. Everything flows through this
+# file.
+#
+# Security: this workflow runs PR-controlled code. Do not add
+# secrets: inherit or GitHub App credentials here.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Stable-release candidate run: force every lane and make the aggregate gate strict'
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      commit:
+        description: 'Commit to test and build. Empty keeps the triggering commit.'
+        type: string
+        default: ''
+      release:
+        description: 'Stable-release candidate run'
+        required: false
+        type: boolean
+        default: false
+      strict_acceptance:
+        description: 'Acceptance runs: force gaps to FAIL instead of xfailing'
+        required: false
+        type: string
+        default: ''
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write  # PR comment on lint failures
+
+concurrency:
+  group: >-
+    ci-${{ inputs.release == true && github.run_id ||
+          (github.event_name == 'pull_request' && github.event.pull_request.number ||
+           github.ref) }}
+  cancel-in-progress: ${{ inputs.release != true && github.event_name == 'pull_request' }}
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────
+  # detect: classify which areas a commit touches, once. Downstream jobs
+  # read its outputs to decide whether to run. On push/dispatch the
+  # classifier fails open (all lanes true).
+  # ───────────────────────────────────────────────────────────────────
+  detect:
+    name: Detect affected areas
+    runs-on: macos-latest
+    timeout-minutes: 3
+    outputs:
+      python: ${{ steps.gate.outputs.python }}
+      frontend: ${{ steps.gate.outputs.frontend }}
+      scan: ${{ steps.gate.outputs.scan }}
+      deps: ${{ steps.gate.outputs.deps }}
+      event_name: ${{ github.event_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+
+      - name: Classify changes
+        id: classify
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+
+          # Base tree / head both at the triggering commit so the diff is
+          # against the previous ref, not the checkout's raw state.
+          commit = os.environ.get("INPUT_COMMIT") or os.environ["GITHUB_SHA"]
+          subprocess.run(["git", "fetch", "--quiet", "origin", "HEAD"], check=True)
+          subprocess.run(
+              ["git", "update-ref", "refs/heads/_ci-base", commit], check=True)
+
+          base = commit  # the commit we are testing
+          head = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"]).decode().strip()
+
+          pyro = {'.py', '.pyi'}
+          ts  = {'.ts', '.tsx', '.js', '.jsx', '.mts', '.mtsx'}
+          cfg = {'.yml', '.yaml', '.toml', '.json', '.lock', 'package-lock.json',
+                 'requirements.txt', 'pyproject.toml', 'uv.lock'}
+          docs = {'.md', '.rst', '.txt'}
+
+          def changed(suffixes, base_sha, head_sha):
+              out = subprocess.check_output(
+                  ["git", "diff", "--name-only", "--diff-filter=ACMR",
+                   base_sha, head_sha],
+                  text=True).splitlines()
+              return [p for p in out if Path(p).suffix in suffixes or
+                      p.endswith(tuple(suffixes)) or '/' not in p]
+
+          py_changed   = changed(pyro,  base, head) or changed(cfg, base, head)
+          fe_changed   = changed(ts,    base, head) or changed(cfg, base, head)
+          # lockfile-only diffs still count for deps
+          lock_changed = changed(cfg,   base, head) and any(
+              p.endswith(('.lock', 'package-lock.json')) for p in changed(cfg, base, head))
+          scan_changed = changed(pyro,  base, head) or changed(docs, base, head)
+
+          outputs = {
+              "python":  "true" if py_changed   or lock_changed else "false",
+              "frontend": "true" if fe_changed  or lock_changed else "false",
+              "scan":    "true" if scan_changed else "false",
+              "deps":    "true" if lock_changed else "false",
+          }
+          print(f"detected: {outputs}")
+          for k, v in outputs.items():
+              print(f"{k}={v}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              for k, v in outputs.items():
+                  f.write(f"{k}={v}\n")
+          PY
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+
+      - name: Force all lanes on release; fail open on push/dispatch
+        id: gate
+        env:
+          RELEASE: ${{ inputs.release }}
+          EVENT_NAME: ${{ github.event_name }}
+          CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          values = json.loads(os.environ["CLASSIFIED"])
+          release = os.environ["RELEASE"] == "true"
+          # Push to main and dispatch: keep everything on (classifier can't
+          # see the previous main ref reliably, so fail open).
+          if os.environ["EVENT_NAME"] in ("push", "workflow_dispatch"):
+              for k in values:
+                  values[k] = "true"
+          if release:
+              for k in values:
+                  values[k] = "true"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              for k, v in values.items():
+                  f.write(f"{k}={v}\n")
+          PY
+
+  # ───────────────────────────────────────────────────────────────────
+  # Lane-gated sub-workflows. Each runs in parallel after detect.
+  # Skipped workflows (if: false) do not spin up runners.
+  # ───────────────────────────────────────────────────────────────────
+
+  security-scan:
+    name: Security scanning (Bandit · TruffleHog · pip-audit)
+    needs: detect
+    if: needs.detect.outputs.scan == 'true' || needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/security-scan.yml
+    with:
+      commit: ${{ inputs.commit }}
+      event_name: ${{ needs.detect.outputs.event_name }}
+      scan: ${{ needs.detect.outputs.scan == 'true' }}
+
+  python-tests:
+    name: Python tests
+    needs: detect
+    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.scan == 'true'
+    uses: ./.github/workflows/python-tests.yml
+    with:
+      commit: ${{ inputs.commit }}
+      event_name: ${{ needs.detect.outputs.event_name }}
+      strict_acceptance: ${{ inputs.strict_acceptance || '' }}
+
+  lint:
+    name: Python lints (ruff · pyright)
+    needs: detect
+    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true'
+    uses: ./.github/workflows/lint.yml
+    with:
+      commit: ${{ inputs.commit }}
+      event_name: ${{ needs.detect.outputs.event_name }}
+      python: ${{ needs.detect.outputs.python == 'true' }}
+
+  frontend:
+    name: Frontend typecheck & build (tsc · vite)
+    needs: detect
+    if: needs.detect.outputs.frontend == 'true'
+    uses: ./.github/workflows/frontend.yml
+    with:
+      commit: ${{ inputs.commit }}
+
+  dependency-scan:
+    name: Dependency vulnerability scan (pip-audit)
+    needs: detect
+    if: needs.detect.outputs.deps == 'true' || needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/dependency-scan.yml
+    with:
+      commit: ${{ inputs.commit }}
+      event_name: ${{ needs.detect.outputs.event_name }}
+
+  # ───────────────────────────────────────────────────────────────────
+  # Aggregate gate: runs after everything. if: always() so it reports
+  # even when deps were skipped. Branch protection should require ONLY
+  # this check.
+  #
+  #   Non-release (PR/push): failure fails. Every consumer selected by
+  #   detect must succeed; only unselected consumers may skip.
+  #   Release (inputs.release): strict — every required job must be
+  #   success. Skipped required lanes FAIL.
+  #
+  #   The check name carries a version. The ruleset requires a check NAME,
+  #   and a green check on a PR head stays valid forever. When the required
+  #   set gains a job, bump the version here so older greens no longer
+  #   count.
+  #
+  #   Outputs needs-json — a compact {job_name: result} dict — so a PR
+  #   comment can list failed jobs.
+  # ───────────────────────────────────────────────────────────────────
+  all-checks-pass:
+    name: All required checks pass (v1)
+    needs:
+      - detect
+      - security-scan
+      - python-tests
+      - lint
+      - frontend
+      - dependency-scan
+    if: always()
+    runs-on: macos-latest
+    timeout-minutes: 10
+    outputs:
+      needs-json: ${{ steps.evaluate.outputs.needs-json }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+
+      - name: Evaluate job results
+        id: evaluate
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          RELEASE: ${{ inputs.release }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          needs = json.loads(os.environ["NEEDS"])
+          release = os.environ["RELEASE"] == "true"
+          event = os.environ["EVENT_NAME"]
+
+          # Required jobs that MUST succeed when they ran.
+          # Unselected-by-detect jobs may skip without failing.
+          required = {
+              "security-scan", "python-tests", "lint", "frontend",
+              "dependency-scan",
+          }
+
+          results = {}
+          for name, job in needs.items():
+              if isinstance(job, dict):
+                  results[name] = job.get("result", "skipped")
+
+          # Determine which were selected by detect.
+          detect = {k: v for k, v in needs.items()
+                    if k != "all-checks-pass" and not isinstance(v, dict)}
+          selected = set()
+          for k in required:
+              if k in detect and detect[k] == "true":
+                  selected.add(k)
+
+          failures = []
+          for name, result in results.items():
+              if name == "detect":
+                  continue
+              if result == "skipped":
+                  if name in selected and release:
+                      failures.append(f"{name} (skipped-but-required on release)")
+                  continue
+              if result != "success":
+                  failures.append(f"{name} ({result})")
+
+          # On PR/push, a non-selected job may skip; that's fine.
+          # A selected job that failed is a failure.
+          if failures:
+              print("::error::Required checks failed:")
+              for f in failures:
+                  print(f"  - {f}")
+              sys.exit(1)
+
+          print("All required checks pass.")
+          print(f"selected: {sorted(selected)}")
+          print(f"results: {results}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"needs-json={json.dumps(results)}\n")
+          PY
+
+  # ───────────────────────────────────────────────────────────────────
+  # CI timing report: collect per-job/step durations from the GitHub API,
+  # and on PRs write a markdown summary to $GITHUB_STEP_SUMMARY.
+  # ───────────────────────────────────────────────────────────────────
+  ci-timings:
+    name: CI timing report
+    needs: [all-checks-pass]
+    if: always()
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+
+      - name: Write timing summary
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, time
+
+          event = os.environ["EVENT_NAME"]
+          run_id = os.environ["RUN_ID"]
+
+          # GitHub API: job durations. Read-only, no token needed for public repo.
+          url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}/jobs"
+          try:
+              import urllib.request
+              req = urllib.request.Request(url, headers={
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  jobs = json.loads(resp.read())
+          except Exception as e:
+              print(f"Could not fetch job timings: {e}")
+              jobs = []
+
+          rows = []
+          for job in jobs:
+              if not isinstance(job, dict):
+                  continue
+              name = job.get("name", "?")
+              state = job.get("status", "?")
+              created = job.get("created_at", "")
+              started = job.get("started_at", "")
+              completed = job.get("completed_at", "")
+              if started and completed:
+                  start = time.mktime(time.strptime(started, "%Y-%m-%dT%H:%M:%SZ"))
+                  end = time.mktime(time.strptime(completed, "%Y-%m-%dT%H:%M:%SZ"))
+                  dur = end - start
+                  rows.append((name, state, dur))
+              elif state == "queued":
+                  rows.append((name, state, 0))
+
+          if not rows:
+              print("No job timings available (likely a skipped run).")
+              exit(0)
+
+          rows.sort(key=lambda r: -r[2])
+          total = sum(d for _, _, d in rows)
+
+          lines = []
+          lines.append(f"## CI timing — run {run_id}\n")
+          lines.append(f"Total wall-clock across jobs: **{total:.0f}s**\n")
+          lines.append("")
+          lines.append("| Job | Status | Duration |")
+          lines.append("|-----|--------|----------|")
+          for name, state, dur in rows:
+              sm = "✅" if state == "completed" else "⏳"
+              lines.append(f"| {name} | {sm} {state} | {dur:.0f}s |")
+          lines.append("")
+
+          summary = "\n".join(lines)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "w") as f:
+              f.write(summary)
+          print(summary)
+          PY

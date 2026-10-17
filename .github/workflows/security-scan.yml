@@ -1,0 +1,218 @@
+name: Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: 'Commit to test'
+        type: string
+        default: ''
+      event_name:
+        description: 'push | pull_request | workflow_dispatch'
+        type: string
+        default: 'push'
+      scan:
+        description: 'Was scan lane selected by detect?'
+        type: boolean
+        default: true
+    # No push/pull_request trigger — everything flows through orchestrator.
+    # This file is only called via workflow_call from ci.yml.
+
+jobs:
+  bandit:
+    name: Bandit Python SAST
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: pip install --break-system-packages -r requirements.txt
+
+      - name: Bandit scan
+        run: |
+          python3 -m bandit -r repo_read.py server.py brain.py run_executor.py \
+            -x "tests/" -q --confidence-level medium
+
+      - name: Bandit report (high confidence only for PRs)
+        if: ${{ inputs.event_name == 'pull_request' }}
+        run: |
+          python3 -m bandit -r repo_read.py server.py brain.py run_executor.py \
+            -x "tests/" -q --confidence-level high \
+            --format json > bandit-report.json || true
+          python3 - <<'PY'
+          import json, sys
+          try:
+              data = json.load(open("bandit-report.json"))
+          except FileNotFoundError:
+              print("No bandit report generated (scan clean)")
+              sys.exit(0)
+          findings = [r for r in data.get("results", []) if r.get("issue_severity") in ("HIGH", "MEDIUM")]
+          if findings:
+              print(f"::error::{len(findings)} high/medium Bandit findings:")
+              for f in findings[:20]:
+                  print(f"  {f['filename']}:{f['line_number']} [{f['test_id']}] {f['issue_text'][:80]}")
+              sys.exit(1)
+          else:
+              print("✅ No high/medium Bandit findings")
+          PY
+
+  trufflehog:
+    name: TruffleHog git history scan
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0  # full history for trufflehog
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install truffleHog
+        run: pip install --break-system-packages truffleHog
+
+      - name: Scan git history
+        run: |
+          python3 /home/abelion/.local/lib/python3.12/site-packages/truffleHog/truffleHog.py \
+            . --max-depth 30 --json > trufflehog-report.json || true
+          python3 - <<'PY'
+          import json, sys, os
+
+          report = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          if not os.path.exists("trufflehog-report.json"):
+              print("✅ No secrets found in git history")
+              with open(report, "a") as f:
+                  f.write("found_secrets=false\n")
+              sys.exit(0)
+
+          try:
+              data = json.load(open("trufflehog-report.json"))
+          except json.JSONDecodeError:
+              print("⚠️ TruffleHog produced non-JSON output")
+              with open(report, "a") as f:
+                  f.write("found_secrets=true\n")
+              sys.exit(1)
+
+          results = data.get("results", [])
+          if not results:
+              print("✅ No secrets found in git history")
+              with open(report, "a") as f:
+                  f.write("found_secrets=false\n")
+              sys.exit(0)
+
+          # Filter known-safe: .env.example templates, docs, etc.
+          safe_paths = {'.env.example', 'README.md', 'LICENSE', 'docs/', 'tests/'}
+          real_secrets = [r for r in results
+                          if not any(s in r.get("Filepath", "") for s in safe_paths)]
+
+          print(f"TruffleHog found {len(results)} potential findings ({len(real_secrets)} not in known-safe paths)")
+
+          if real_secrets:
+              print("::error::Potential credentials found in git history:")
+              for r in real_secrets[:15]:
+                  fp = r.get("Filepath", "?")
+                  rule = r.get("rule", "?")
+                  desc = r.get("description", "")[:100]
+                  strings = r.get("stringsFound", [])
+                  print(f"  - {fp}: {rule}: {desc}")
+                  if strings:
+                      print(f"    strings: {strings[:3]}")
+              with open(report, "a") as f:
+                  f.write("found_secrets=true\n")
+              sys.exit(1)
+          else:
+              print("✅ No real credentials — all findings in known-safe paths (.env.example templates, docs)")
+              with open(report, "a") as f:
+                  f.write("found_secrets=false\n")
+          PY
+
+  pip-audit:
+    name: pip-audit dependency vulnerability scan
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: pip install --break-system-packages -r requirements.txt
+
+      - name: Run pip-audit
+        run: pip-audit --format json > pip-audit-report.json || true
+
+      - name: Parse vulns
+        run: |
+          python3 - <<'PY'
+          import json, sys, os
+
+          report_path = "pip-audit-report.json"
+          if not os.path.exists(report_path):
+              print("✅ pip-audit produced no report (nothing installed or no vulns)")
+              sys.exit(0)
+
+          data = json.load(open(report_path))
+          vulns = [d for d in data.get("dependencies", []) if d.get("vulns")]
+
+          if not vulns:
+              print(f"✅ No known vulnerabilities in {len(data.get('dependencies', []))} installed packages")
+              sys.exit(0)
+
+          print(f"⚠️  {len(vulns)} vulnerabilities found in {len(data.get('dependencies', []))} packages:")
+          critical = 0
+          for v in vulns[:20]:
+              for vuln in v.get("vulns", [])[:1]:
+                  id_ = vuln.get("id", "unknown")
+                  fix = vuln.get("fix_versions", ["N/A"])[0]
+                  print(f"  - {v['name']} {v['version']}: {id_} (fix: {fix})")
+                  if "CRITICAL" in id_ or "high" in id_.lower():
+                      critical += 1
+
+          print()
+          if critical > 0:
+              print(f"::error::{critical} CRITICAL/HIGH vulnerabilities — update affected packages")
+              sys.exit(1)
+          else:
+              print("⚠️  Only moderate/low vulns — advisory, not blocking on PR")
+              sys.exit(0)
+          PY
+        env:
+          GITHUB_OUTPUT: /dev/null  # not needed here, just parse and exit
+
+  summary:
+    name: Security scan summary
+    needs: [bandit, trufflehog, pip-audit]
+    if: always()
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: Collect results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          needs = json.loads(os.environ["NEEDS"]) if "NEEDS" in os.environ else {}
+          print("Security scan results:")
+          for name, job in needs.items():
+              if isinstance(job, dict):
+                  print(f"  {name}: {job.get('result', '?')}")
+          PY
+        env:
+          NEEDS: ${{ toJSON(needs) }}

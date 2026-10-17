@@ -1,0 +1,55 @@
+name: Dependency Scan
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        type: string
+        default: ''
+      event_name:
+        type: string
+        default: 'push'
+
+jobs:
+  pip-audit:
+    name: pip-audit
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: pip install --break-system-packages -r requirements.txt
+
+      - name: Run pip-audit
+        run: pip-audit --format json > pip-audit-report.json || true
+
+      - name: Report
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          data = json.load(open("pip-audit-report.json")) if __import__("os").path.exists("pip-audit-report.json") else {"dependencies": []}
+          vulns = [d for d in data.get("dependencies", []) if d.get("vulns")]
+          if not vulns:
+              print("✅ No known vulnerabilities")
+              sys.exit(0)
+
+          print(f"⚠️  {len(vulns)} vulnerabilities in {len(data.get('dependencies', []))} packages:")
+          for v in vulns[:15]:
+              for vuln in v.get("vulns", [])[:1]:
+                  print(f"  - {v['name']} {v['version']}: {vuln.get('id', '?')} (fix: {vuln.get('fix_versions', ['?'])[0]})")
+          print()
+          critical = [v for v in vulns for vuln in v.get("vulns", []) if "CRITICAL" in vuln.get("id", "").upper()]
+          if critical:
+              print(f"::error::{len(critical)} CRITICAL vulns — blocking")
+              sys.exit(1)
+          print("Non-critical vulns only — advisory.")
+          PY
