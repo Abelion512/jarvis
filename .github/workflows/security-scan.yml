@@ -149,7 +149,6 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-
       - name: Install deps
         run: pip install --break-system-packages -r requirements.txt
 
