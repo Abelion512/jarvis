@@ -23,8 +23,6 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.commit }}
 
       - uses: actions/setup-python@v5
         with:
