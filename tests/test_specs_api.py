@@ -1,3 +1,5 @@
+import os
+import time
 """The review surface, as the page and as JARVIS see it.
 
 `/api/specs` and `/api/specs/doc` feed the SPECS tab; `review_document` and
@@ -65,8 +67,9 @@ def wired(monkeypatch, tmp_path):
     root = tmp_path / "claude-browser"
     root.mkdir()
     relative = builds.write_spec(str(root), SPEC_BODY)
-    (root / builds.PLAN_DIR / "2026-09-03-plan.md").write_text(
-        PLAN, encoding="utf-8")
+    plan_file = root / builds.PLAN_DIR / "2099-01-01-plan.md"
+    plan_file.write_text(PLAN, encoding="utf-8")
+    os.utime(plan_file, (time.time() + 10, time.time() + 10))
 
     server.cached_projects = [
         {"name": "claude-browser", "path": str(root), "branch": "main"}]
@@ -235,7 +238,7 @@ def test_once_approved_a_plan_in_flight_reads_as_building(client):
 
 def test_a_finished_plan_reads_as_work_awaiting_review(client):
     c, _, root, _ = client
-    plan = root / builds.PLAN_DIR / "2026-09-03-plan.md"
+    plan = root / builds.PLAN_DIR / "2099-01-01-plan.md"
     plan.write_text(plan.read_text(encoding="utf-8").replace("- [ ]", "- [x]"),
                     encoding="utf-8")
     for d in specs.list_documents(str(root)):
@@ -260,7 +263,7 @@ def test_a_plan_arrives_with_its_task_progress(client):
     c, _, _, _ = client
     body = c.get("/api/specs/doc",
                  params={"project": "claude-browser",
-                         "path": f"{builds.PLAN_DIR}/2026-09-03-plan.md"}).json()
+                         "path": f"{builds.PLAN_DIR}/2099-01-01-plan.md"}).json()
     assert body["progress"]["done"] == 1
     assert body["progress"]["current_section"] == 2
 
@@ -317,7 +320,7 @@ def test_review_document_reads_back_the_numbered_outline(wired):
 def test_review_document_reads_one_section_when_given_its_number(wired):
     server, root, _ = wired
     said = server.tool_review_document({"project": "claude-browser",
-                                        "path": f"{builds.PLAN_DIR}/2026-09-03-plan.md",
+                                        "path": f"{builds.PLAN_DIR}/2099-01-01-plan.md",
                                         "section": 2})
     assert "Serve the list" in said
     assert "Read the files off disk" not in said
@@ -358,7 +361,7 @@ def test_the_page_and_jarvis_are_handed_the_same_numbering(client):
     """The guarantee. Both sides come out of `specs.read_document`, so a
     number the user says lands on the same section either way."""
     c, server, root, _ = client
-    plan_path = f"{builds.PLAN_DIR}/2026-09-03-plan.md"
+    plan_path = f"{builds.PLAN_DIR}/2099-01-01-plan.md"
     page = c.get("/api/specs/doc",
                  params={"project": "claude-browser", "path": plan_path}).json()
     for section in page["sections"]:

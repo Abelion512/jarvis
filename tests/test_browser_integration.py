@@ -195,3 +195,4 @@ async def test_browser_close_idempotent():
     b = JarvisBrowser()
     await b.close()
     await b.close()  # Should not raise
+    assert (b._pw, b._browser, b._context) == (None, None, None)

@@ -31,8 +31,8 @@ class _Speech:
 @pytest.mark.asyncio
 async def test_a_failing_check_is_spoken(monkeypatch):
     """A dead brain is exactly when the user cannot ask what is wrong."""
-    checks = [_check("claude_login", preflight.STATUS_FAIL,
-                     "claude is not logged in")]
+    checks = [_check("hermes_login", preflight.STATUS_FAIL,
+                     "hermes is not logged in")]
     monkeypatch.setattr(preflight, "run_checks", lambda **k: _async(checks))
     sp = _Speech()
     monkeypatch.setattr(server, "speech", sp)
@@ -79,6 +79,7 @@ async def test_a_broken_check_never_costs_the_user_their_server(monkeypatch):
     monkeypatch.setattr(server, "speech", _Speech())
 
     await server._run_preflight()   # must not raise
+    assert server.speech.said == []  # broken checks say nothing, cost nothing
 
 
 def test_lifespan_actually_calls_it():

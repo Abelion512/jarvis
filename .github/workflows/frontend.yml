@@ -1,0 +1,34 @@
+name: Frontend
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        type: string
+        default: ''
+
+jobs:
+  typecheck-and-build:
+    name: tsc + vite build
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install frontend deps
+        run: npm ci || npm install
+        working-directory: frontend
+
+      - name: TypeScript typecheck
+        run: npx tsc --noEmit
+        working-directory: frontend
+
+      - name: Vite build
+        run: npm run build
+        working-directory: frontend
