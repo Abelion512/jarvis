@@ -81,8 +81,6 @@ ALLOWED_TOOLS = [
     "mcp__jarvis__remember",
     "mcp__jarvis__recall",
     "mcp__jarvis__learn_correction",
-    "mcp__jarvis__forget_correction",
-    "mcp__jarvis__list_corrections",
     "mcp__jarvis__project_note",
     "mcp__jarvis__write_journal",
     # The CLI's own two, and the only non-JARVIS tools here. JARVIS could read

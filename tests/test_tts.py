@@ -85,17 +85,18 @@ async def test_client_parameter_is_accepted_for_compatibility():
     assert sig.parameters["client"].default is None
 
 
-def test_voice_override_takes_precedence(monkeypatch):
+@pytest.mark.asyncio
+async def test_voice_override_takes_precedence(monkeypatch):
     """When voice_override is set, it should be used instead of language-based selection."""
     import sys
     import types
-    import asyncio
     import tts
     seen = {}
 
     class FakeCommunicate:
         def __init__(self, text, voice):
             seen["voice"] = voice
+            seen["text"] = text
 
         async def stream(self):
             yield {"type": "audio", "data": b"1234"}
@@ -104,7 +105,7 @@ def test_voice_override_takes_precedence(monkeypatch):
     fake_mod = types.ModuleType("edge_tts")
     fake_mod.Communicate = FakeCommunicate
     monkeypatch.setitem(sys.modules, "edge_tts", fake_mod)
-    r = asyncio.run(tts.synthesize_chunk("halo", language="id", voice_override="custom-voice"))
+    r = await tts.synthesize_chunk("hello", language="en", voice_override="custom-voice")
     assert r is not None and r.audio == b"1234"
     assert seen["voice"] == "custom-voice"
 

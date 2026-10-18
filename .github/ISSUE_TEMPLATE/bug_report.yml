@@ -1,0 +1,122 @@
+name: "🐛 Bug Report"
+description: Report a bug — something that's broken, crashes, or behaves incorrectly.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the sections below so we can reproduce and fix it quickly.
+
+        **Before submitting**, please:
+        - [ ] Search [existing issues](https://github.com/abelion/jarvis/issues) to avoid duplicates
+        - [ ] Update to the latest version and confirm the bug still exists
+        - [ ] Include your OS, Python version, and any error output from the terminal
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear description of what's broken. Include error messages, tracebacks, or screenshots if relevant.
+      placeholder: |
+        What happened? What did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to trigger the bug. The more specific, the faster we can fix it.
+      placeholder: |
+        1. Start JARVIS: `python server.py`
+        2. Say "..."
+        3. JARVIS does X instead of Y
+        4. Error appears: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should have happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened? Include full error output if available.
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      description: e.g. macOS 15.2, Ubuntu 24.04, Windows 11
+      placeholder: macOS 15.2
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python Version
+      description: Output of `python --version`
+      placeholder: "3.11.9"
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment Details
+      description: How did you install/start JARVIS? Any relevant config or setup?
+      placeholder: |
+        Installed via: cloned repo + pip install
+        Frontend: bun run dev
+        Chrome version: 130.0.x
+        Claude Code: 2.1.224
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error Output / Logs
+      description: Paste the full error message, traceback, or terminal output. This will be auto-formatted.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: root-cause
+    attributes:
+      label: Root Cause Analysis (optional)
+      description: |
+        If you've dug into the code and identified the root cause, share it here.
+        Include file paths, line numbers, and code snippets if possible. This massively speeds up fixes.
+      placeholder: |
+        The bug is in `server.py` line 949. `len(history)` counts session_meta entries
+        but `agent_messages` was built from filtered history...
+
+  - type: textarea
+    id: proposed-fix
+    attributes:
+      label: Proposed Fix (optional)
+      description: If you have a fix in mind (or a PR ready), describe it here.
+      placeholder: |
+        Replace `.get()` with `.pop()` on line 289 of `server.py`
+        to actually clear the pending message after retrieval.
+
+  - type: checkboxes
+    id: pr-ready
+    attributes:
+      label: Are you willing to submit a PR for this?
+      options:
+        - label: I'd like to fix this myself and submit a PR
+
+  - type: input
+    id: contact
+    attributes:
+      label: Contact (optional)
+      description: Your email or Discord handle, in case we need to follow up.

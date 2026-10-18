@@ -1,0 +1,43 @@
+# Code owners for JARVIS. GitHub requests review from the
+# matching team(s) when a PR changes files under a given path.
+# Patterns without a leading slash match at any depth; last match wins.
+
+# CI, automation, and tooling config: these decide what runs and what ships.
+.github/                    @abelion
+
+# Dependency manifests — an edit here changes what gets installed.
+requirements.txt            @abelion
+frontend/package.json       @abelion
+frontend/bun.lock           @abelion
+
+# Backend (server, brain, MCP tools, run stores).
+server.py                   @abelion
+brain.py                    @abelion
+jarvis_mcp.py               @abelion
+jarvis_memory.py            @abelion
+run_store.py                @abelion
+run_executor.py             @abelion
+*.py                        @abelion
+
+# Frontend dashboard / voice UI.
+frontend/                   @abelion
+
+# Database migrations and data paths.
+migrations/                 @abelion
+data_paths.py               @abelion
+
+# Scripts that drive setup, builds, or automation.
+scripts/                    @abelion
+setup.py                    @abelion
+
+# Skills and bundled prompts.
+skills/                     @abelion
+
+# Tests.
+tests/                      @abelion
+pytest.ini                  @abelion
+
+# Docs.
+README.md                   @abelion
+CONTRIBUTING.md             @abelion
+CLAUDE.md                   @abelion

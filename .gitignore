@@ -51,10 +51,15 @@ context/
 # Superpowers SDD scratch
 .superpowers/
 
+<<<<<<< Updated upstream
 # A stray, never-completed clone of an unrelated project (tt-a1i/archify).
 # Not ours, referenced by nothing; ignored so it stops showing as an untracked
 # addition. Nothing in it is needed — delete it whenever convenient.
 archify/
+=======
+# PowerPoint
+*.pptx
+>>>>>>> Stashed changes
 
 # <!-- orcha:managed:start v2 -->
 # Orcha session summaries — local-only by default. Contains prompt + output

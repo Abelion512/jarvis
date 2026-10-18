@@ -1,0 +1,60 @@
+# Auto-label PRs based on changed files.
+# Each entry maps a glob pattern to the label(s) it applies.
+# Pattern syntax: minimatch (same as .gitignore / GitHub Actions paths).
+# Last match wins, so order does not matter when labels are disjoint.
+
+backend:
+  - changed-files:
+      any-glob-to-any-file:
+        - "**/*.py"
+  - labels: ["backend"]
+
+frontend:
+  - changed-files:
+      any-glob-to-any-file:
+        - "frontend/**"
+        - "**/*.{ts,tsx,js,jsx,css,html}"
+  - labels: ["frontend"]
+
+ci:
+  - changed-files:
+      any-glob-to-any-file:
+        - ".github/workflows/**"
+        - ".github/labeler.yml"
+  - labels: ["ci"]
+
+docs:
+  - changed-files:
+      any-glob-to-any-file:
+        - "**/*.md"
+        - "CONTRIBUTING.md"
+        - "README.md"
+  - labels: ["docs"]
+
+tests:
+  - changed-files:
+      any-glob-to-any-file:
+        - "tests/**"
+        - "**/*.test.{py,ts,tsx,js,jsx}"
+  - labels: ["tests"]
+
+dependencies:
+  - changed-files:
+      any-glob-to-any-file:
+        - "requirements.txt"
+        - "frontend/package.json"
+        - "frontend/bun.lock"
+        - "**/requirements*.txt"
+  - labels: ["dependencies"]
+
+migrations:
+  - changed-files:
+      any-glob-to-any-file:
+        - "migrations/**"
+  - labels: ["migrations"]
+
+skills:
+  - changed-files:
+      any-glob-to-any-file:
+        - "skills/**"
+  - labels: ["skills"]
