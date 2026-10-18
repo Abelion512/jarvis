@@ -106,6 +106,7 @@ def gh(monkeypatch):
             self.answers.append((match, (rc, out, err)))
 
     fake = _Gh()
+    monkeypatch.setattr(gh_lookup, "gh_path", lambda: "/usr/bin/gh")
     monkeypatch.setattr(gh_lookup, "_run_gh", fake.run)
     # The login is looked up once and cached; never let a test hit the real one.
     fake.when(lambda a: a[:2] == ["api", "user"], out="tonystark\n")

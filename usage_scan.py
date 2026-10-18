@@ -197,6 +197,7 @@ class FileTotals:
     """
     dev: int = 0
     ino: int = 0
+    mtime_ns: int = 0
     offset: int = 0
     tokens: Tokens = ZERO
     turns: int = 0
@@ -292,14 +293,23 @@ def scan_file(path: Path, cache: Cache) -> tuple[FileTotals, int, bool]:
     if (prior is not None and prior.dev == st.st_dev and prior.ino == st.st_ino
             and st.st_size >= prior.offset):
         if st.st_size == prior.offset:
-            return prior, 0, True           # already read, to the last byte
-        totals = prior.copy()
+            if st.st_mtime_ns != prior.mtime_ns:
+                # Same path, same size, same inode — but rewritten (inode
+                # numbers are reused after unlink). Size alone calls that
+                # unchanged and reports the old totals forever.
+                totals = FileTotals(dev=st.st_dev, ino=st.st_ino,
+                                    mtime_ns=st.st_mtime_ns)
+            else:
+                return prior, 0, True       # already read, to the last byte
+        else:
+            totals = prior.copy()
     else:
         # A new file, a rotated one (same path, different inode), or one that
         # shrank. Any resume would be a total that no longer describes it.
-        totals = FileTotals(dev=st.st_dev, ino=st.st_ino)
+        totals = FileTotals(dev=st.st_dev, ino=st.st_ino,
+                            mtime_ns=st.st_mtime_ns)
 
-    totals.dev, totals.ino = st.st_dev, st.st_ino
+    totals.dev, totals.ino, totals.mtime_ns = st.st_dev, st.st_ino, st.st_mtime_ns
 
     try:
         with open(path, "rb") as fh:
