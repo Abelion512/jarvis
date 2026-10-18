@@ -70,7 +70,7 @@ jobs:
       deps: ${{ steps.gate.outputs.deps }}
       event_name: ${{ github.event_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.commit }}
 
@@ -238,7 +238,7 @@ jobs:
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.commit || github.sha }}
 
@@ -313,7 +313,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.commit || github.sha }}
 

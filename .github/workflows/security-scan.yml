@@ -24,16 +24,17 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.commit }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install deps
-        run: pip install --break-system-packages -r requirements.txt
+        run: pip install --break-system-packages bandit -r requirements.txt
 
       - name: Bandit scan
         run: |
@@ -68,22 +69,22 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.commit }}
           fetch-depth: 0  # full history for trufflehog
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install truffleHog
         run: pip install --break-system-packages truffleHog
 
       - name: Scan git history
         run: |
-          python3 /home/abelion/.local/lib/python3.12/site-packages/truffleHog/truffleHog.py \
-            . --max-depth 30 --json > trufflehog-report.json || true
+          trufflehog . --max-depth 30 --json > trufflehog-report.json || true
           python3 - <<'PY'
           import json, sys, os
 
@@ -140,15 +141,17 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.commit }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+
       - name: Install deps
-        run: pip install --break-system-packages -r requirements.txt
+        run: pip install --break-system-packages pip-audit -r requirements.txt
 
       - name: Run pip-audit
         run: pip-audit --format json > pip-audit-report.json || true
@@ -210,5 +213,3 @@ jobs:
               if isinstance(job, dict):
                   print(f"  {name}: {job.get('result', '?')}")
           PY
-        env:
-          NEEDS: ${{ toJSON(needs) }}
