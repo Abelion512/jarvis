@@ -2399,7 +2399,7 @@ async def api_usage_sessions():
         log.warning("usage scan failed", exc_info=True)
         return JSONResponse(status_code=503, content={
             "measured": False, "sessions": [], "daily": [],
-            "error": f"could not read the transcripts: {e}",
+            "error": "could not read the transcripts",
         })
 
 
@@ -7403,7 +7403,7 @@ async def api_settings_keys(body: KeyUpdate):
     try:
         _write_env_key(body.key_name, body.key_value)
     except ValueError as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=400)
+        return JSONResponse({"success": False, "error": "invalid key value"}, status_code=400)
     return {"success": True}
 
 @app.post("/api/settings/test-edge-tts")
@@ -7429,7 +7429,7 @@ async def api_test_edge_tts(body: KeyTest):
         else:
             return {"valid": False, "error": "Edge TTS returned no audio"}
     except Exception as e:
-        return {"valid": False, "error": str(e)[:200]}
+        return {"valid": False, "error": "edge_tts test failed"}
 
 @app.post("/api/settings/test-fish")
 async def api_test_fish(body: KeyTest):
@@ -7484,7 +7484,7 @@ async def api_save_preferences(body: PreferencesUpdate):
         _write_env_key("USER_NAME", body.user_name)
         _write_env_key("HONORIFIC", body.honorific)
     except ValueError as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=400)
+        return JSONResponse({"success": False, "error": "invalid preference value"}, status_code=400)
     return {"success": True}
 
 # ---------------------------------------------------------------------------

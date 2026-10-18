@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-SECRET = "sk-live-notion-token-do-not-read-me"
+SECRET = "test-sensitive-marker-value"
 
 
 @pytest.fixture

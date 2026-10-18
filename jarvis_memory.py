@@ -492,7 +492,7 @@ def _score(query_words: set[str], title: str, body: str) -> int:
     return score
 
 
-_URL_RE = re.compile(r"https?://\S+")
+_URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;%=~-]+")
 _URL_LONG_MIN = 30      # shorter than this reads fine spoken as-is
 _TABLE_ROW = re.compile(r"\|.*\|")
 
