@@ -169,22 +169,20 @@ jobs:
               sys.exit(0)
 
           print(f"⚠️  {len(vulns)} vulnerabilities found in {len(data.get('dependencies', []))} packages:")
-          critical = 0
           for v in vulns[:20]:
               for vuln in v.get("vulns", [])[:1]:
                   id_ = vuln.get("id", "unknown")
                   fix = vuln.get("fix_versions", ["N/A"])[0]
                   print(f"  - {v['name']} {v['version']}: {id_} (fix: {fix})")
-                  if "CRITICAL" in id_ or "high" in id_.lower():
-                      critical += 1
 
+          # pip-audit's JSON records carry no severity — ids are PYSEC-*/
+          # CVE-*/GHSA-* — so the old "CRITICAL/HIGH in id" test matched
+          # nothing and known-vulnerable dependencies stayed advisory
+          # forever. Any vuln blocks; waive one deliberately with
+          # --ignore-vuln <ID> on the step above.
           print()
-          if critical > 0:
-              print(f"::error::{critical} CRITICAL/HIGH vulnerabilities — update affected packages")
-              sys.exit(1)
-          else:
-              print("⚠️  Only moderate/low vulns — advisory, not blocking on PR")
-              sys.exit(0)
+          print(f"::error::{len(vulns)} package(s) with known vulnerabilities — update them, or waive one with --ignore-vuln <ID>")
+          sys.exit(1)
           PY
         env:
           GITHUB_OUTPUT: /dev/null  # not needed here, just parse and exit

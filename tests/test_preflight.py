@@ -286,6 +286,9 @@ async def test_run_checks_runs_all_registered_checks(monkeypatch):
     monkeypatch.setattr(preflight.shutil, "which", lambda name: None)  # CLI missing -> fast fail
     monkeypatch.setattr(preflight.sys, "platform", "linux")  # accessibility skipped -> fast warn
     monkeypatch.setattr(preflight, "_settings_path", lambda: preflight.Path("/nonexistent/settings.json"))
+    # The expected names below are the Hermes backend's; pin it so the
+    # assertion never depends on ambient JARVIS_CLI_PATH.
+    monkeypatch.setenv("JARVIS_CLI_PATH", "hermes")
 
     # Generous timeout: this asserts the SET of checks, and a slow first
     # import under load must not surface as a wrong name (a timed-out check
@@ -411,3 +414,18 @@ async def test_hermes_backend_selects_hermes_checks(monkeypatch):
     monkeypatch.setenv("JARVIS_CLI_PATH", "hermes")
     assert [fn.__name__ for fn in preflight._selected_async_checks()] == [
         "_check_hermes_cli", "_check_hermes_login", "_check_accessibility"]
+
+
+def test_claude_backend_selects_claude_checks(monkeypatch):
+    """No CLI override is the documented default: brain.py spawns `claude`."""
+    monkeypatch.delenv("JARVIS_CLI_PATH", raising=False)
+    monkeypatch.delenv("JARVIS_CLAUDE_PATH", raising=False)
+    assert [fn.__name__ for fn in preflight._selected_async_checks()] == [
+        "_check_claude_cli", "_check_claude_login", "_check_accessibility"]
+
+
+def test_legacy_claude_path_override_still_selects_claude_checks(monkeypatch):
+    monkeypatch.delenv("JARVIS_CLI_PATH", raising=False)
+    monkeypatch.setenv("JARVIS_CLAUDE_PATH", "claude")
+    assert [fn.__name__ for fn in preflight._selected_async_checks()] == [
+        "_check_claude_cli", "_check_claude_login", "_check_accessibility"]

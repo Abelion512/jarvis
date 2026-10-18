@@ -70,25 +70,35 @@ jobs:
       deps: ${{ steps.gate.outputs.deps }}
       event_name: ${{ github.event_name }}
     steps:
+      # Full history: the PR base sha must resolve as a diff endpoint, and a
+      # plain `ref: ${{ inputs.commit }}` is empty on pull_request runs.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.commit }}
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: 0
 
       - name: Classify changes
         id: classify
         run: |
           python3 - <<'PY'
-          import json, os, subprocess
+          import json, os, re, subprocess
           from pathlib import Path
 
-          # Base tree / head both at the triggering commit so the diff is
-          # against the previous ref, not the checkout's raw state.
+          # A pull_request run has no inputs.commit, so `commit` falls back
+          # to GITHUB_SHA -- the same object HEAD is checked out at -- and a
+          # base==head diff lists no files, which skipped every lane while
+          # the aggregate gate still passed. PR runs therefore diff against
+          # the PR's own base sha. Push, dispatch and workflow_call carry no
+          # base in scope; the gate step below fails those open instead.
+          # PR_BASE_SHA reaches git as an argument, so it must actually be a
+          # sha; anything else fails this step, which the gate turns into a
+          # fail-open rather than a silent skip.
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
           commit = os.environ.get("INPUT_COMMIT") or os.environ["GITHUB_SHA"]
-          subprocess.run(["git", "fetch", "--quiet", "origin", "HEAD"], check=True)
-          subprocess.run(
-              ["git", "update-ref", "refs/heads/_ci-base", commit], check=True)
-
-          base = commit  # the commit we are testing
+          pr_base = os.environ.get("PR_BASE_SHA") or ""
+          if event == "pull_request" and not re.fullmatch(r"[0-9a-f]{7,40}", pr_base):
+              raise SystemExit(f"no usable PR base sha in the event: {pr_base!r}")
+          base = pr_base or commit
           head = subprocess.check_output(
               ["git", "rev-parse", "HEAD"]).decode().strip()
 
@@ -127,26 +137,34 @@ jobs:
           PY
         env:
           INPUT_COMMIT: ${{ inputs.commit }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
 
-      - name: Force all lanes on release; fail open on push/dispatch
+      - name: Force all lanes on release; fail open when unclassifiable
         id: gate
+        if: always()  # a failed Classify must still gate, not vanish
         env:
           RELEASE: ${{ inputs.release }}
           EVENT_NAME: ${{ github.event_name }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CLASSIFY_OUTCOME: ${{ steps.classify.outcome }}
           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
         run: |
           python3 - <<'PY'
           import json, os
-          values = json.loads(os.environ["CLASSIFIED"])
+          values = json.loads(os.environ.get("CLASSIFIED") or "{}")
           release = os.environ["RELEASE"] == "true"
-          # Push to main and dispatch: keep everything on (classifier can't
-          # see the previous main ref reliably, so fail open).
-          if os.environ["EVENT_NAME"] in ("push", "workflow_dispatch"):
-              for k in values:
-                  values[k] = "true"
-          if release:
-              for k in values:
-                  values[k] = "true"
+          # Push and dispatch have no base to diff against, an explicit
+          # inputs.commit arrives with no base either, and a classifier that
+          # never produced output is undecidable. All fail open: a broken
+          # detector must not skip every lane on an otherwise green
+          # aggregate.
+          no_base = bool(os.environ["INPUT_COMMIT"]) and not os.environ["PR_BASE_SHA"]
+          unclassifiable = (os.environ["CLASSIFY_OUTCOME"] != "success"
+                            or os.environ["EVENT_NAME"] in ("push", "workflow_dispatch")
+                            or no_base)
+          for k in ("python", "frontend", "scan", "deps"):
+              values[k] = "true" if unclassifiable or release else values.get(k, "false")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               for k, v in values.items():
                   f.write(f"{k}={v}\n")

@@ -47,9 +47,11 @@ jobs:
               for vuln in v.get("vulns", [])[:1]:
                   print(f"  - {v['name']} {v['version']}: {vuln.get('id', '?')} (fix: {vuln.get('fix_versions', ['?'])[0]})")
           print()
-          critical = [v for v in vulns for vuln in v.get("vulns", []) if "CRITICAL" in vuln.get("id", "").upper()]
-          if critical:
-              print(f"::error::{len(critical)} CRITICAL vulns — blocking")
-              sys.exit(1)
-          print("Non-critical vulns only — advisory.")
+          # pip-audit's JSON records are {id, fix_versions, aliases,
+          # description} with PYSEC-*/CVE-*/GHSA-* ids and no severity field,
+          # so looking for "CRITICAL" inside an id never matched and every
+          # vulnerable dependency passed this gate. Any vuln blocks; silence
+          # one deliberately with --ignore-vuln <ID> on the step above.
+          print(f"::error::{len(vulns)} package(s) with known vulnerabilities — update them, or waive one with --ignore-vuln <ID>")
+          sys.exit(1)
           PY
