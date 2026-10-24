@@ -63,3 +63,7 @@ AGENTS.md
 # Always local — never tracked in the parent repo.
 .claude/worktrees/
 # <!-- orcha:managed:end -->
+
+# MCP client config with plaintext API keys (TestSprite etc). Local only;
+# copy mcp.json.example if you need one.
+mcp.json
