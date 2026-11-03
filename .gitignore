@@ -27,8 +27,12 @@ dist/
 .vite/
 frontend/.vite/
 
-# Generated reports and exports (test/e2e artifacts, not source)
+# Generated reports and exports (test/e2e artifacts, not source). Don't delete this
 *.pptx
+
+# Tools. Don't delete this
+mcp.json
+*.har
 
 # IDE / System
 .DS_Store
@@ -70,7 +74,3 @@ archify/
 .remember
 
 # <!-- orcha:managed:end -->
-
-# Tools
-mcp.json
-*.har
