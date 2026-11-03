@@ -374,7 +374,8 @@ def test_the_walk_never_descends_a_miscased_private_root(wired):
     root reached by any other spelling made the walk read the brain home."""
     import repo_read
     _server, project, _dp = wired
-    roots = [project] + [project.parent / s for s in _spellings(project.name)]
+    roots = [project] + [p for s in _spellings(project.name)
+                         for p in [project.parent / s] if p.exists()]
     for root in roots:
         found = repo_read.walk(root)
         leaked = [rel for rel, _ in found.files
@@ -392,6 +393,8 @@ async def test_search_refuses_every_spelling_of_the_root(wired, monkeypatch):
     monkeypatch.setattr(repo_read, "_rg_path", lambda: None)
     for spelling in _spellings(project.name):
         root = project.parent / spelling
+        if not root.is_dir():
+            continue  # case-sensitive volume: no such dir, nothing to wall
         monkeypatch.setattr(server, "cached_projects",
                             [{"name": "jarvis-repo", "path": str(root)}])
         out = await server.tool_search_repo({"project": "jarvis-repo",

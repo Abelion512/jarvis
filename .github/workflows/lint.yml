@@ -1,0 +1,53 @@
+name: Python Lint
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        type: string
+        default: ''
+      event_name:
+        type: string
+        default: 'push'
+      python:
+        type: boolean
+        default: true
+
+jobs:
+  ruff:
+    name: ruff linter
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install --break-system-packages ruff
+
+      - name: Ruff check
+        run: python3 -m ruff check repo_read.py server.py brain.py run_executor.py -q
+
+  pyright:
+    name: pyright type check
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyright
+        run: pip install --break-system-packages pyright
+
+      - name: Pyright check
+        run: python3 -m pyright repo_read.py server.py brain.py run_executor.py

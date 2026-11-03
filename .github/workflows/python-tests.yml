@@ -1,0 +1,49 @@
+name: Python Tests
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: 'Commit to test'
+        type: string
+        default: ''
+      event_name:
+        type: string
+        default: 'push'
+      strict_acceptance:
+        type: string
+        default: ''
+
+# No push/pull_request triggers — called via workflow_call from ci.yml.
+
+jobs:
+  pytest:
+    name: pytest suite
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install --break-system-packages -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium
+
+      - name: Install frontend deps
+        run: npm ci
+        working-directory: frontend
+
+      - name: Run pytest
+        env:
+          JARVIS_BRAIN_AUTOSTART: "0"
+          JARVIS_CLI_PATH: "echo"
+        run: pytest -v -o faulthandler_timeout=300 -p no:cacheprovider
+
+      - name: Run browser tests (optional, marked)
+        if: false  # disabled by default, enable with `pytest -m browser`
+        run: pytest -m browser -v -o faulthandler_timeout=300 -p no:cacheprovider
