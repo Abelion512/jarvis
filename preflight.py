@@ -50,7 +50,7 @@ log = logging.getLogger("jarvis.preflight")
 MIN_CLAUDE_VERSION = (2, 1, 224)
 MIN_CLAUDE_VERSION_STR = "2.1.224"
 
-# A hung subprocess (a wedged `claude`, a modal `osascript` is waiting on)
+# A hung subprocess (a wedged agent CLI, a modal `osascript` is waiting on)
 # must not stall server startup. Each check gets its own budget; they run
 # concurrently in run_checks() so the wall-clock cost is one timeout, not
 # the sum of them.
@@ -87,7 +87,7 @@ async def _run_subprocess(*args: str, timeout: float,
 
     `env=None` (the default) inherits this process's ambient environment,
     same as before. A caller that needs the subprocess to see a SPECIFIC
-    environment -- e.g. `claude_login` checking under exactly the
+    environment -- e.g. `hermes_login` checking under exactly the
     environment the brain spawns with -- passes one explicitly.
 
     Never raises: a spawn failure or a timeout comes back as returncode -1
@@ -133,6 +133,9 @@ def _parse_version(text: str) -> Optional[tuple[int, int, int]]:
 
 
 # ── which agent CLI ────────────────────────────────────────────────────
+# brain.py spawns `claude` unless JARVIS_CLI_PATH names another CLI
+# (JARVIS_CLAUDE_PATH is the legacy spelling of the same override), so the
+# backend defaults to Claude Code and every check below follows it.
 
 def _cli_backend() -> str:
     """'hermes' when JARVIS_CLI_PATH names Hermes Agent, else 'claude'."""
@@ -148,8 +151,8 @@ def _cli_binary() -> str:
 
 
 async def _check_hermes_cli(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
-    """`hermes` is on PATH. No minimum version: unlike Claude Code, no
-    JARVIS feature depends on a version-gated Hermes flag."""
+    """`hermes` is on PATH. No minimum version: no JARVIS feature depends
+    on a version-gated Hermes flag."""
     binary = _cli_binary()
     resolved = shutil.which(binary) or (binary if Path(binary).exists() else None)
     if not resolved:
@@ -600,7 +603,7 @@ def _check_anthropic_key_leftover_sync() -> Check:
         ),
         remedy=(
             "Remove ANTHROPIC_* variables from .env -- JARVIS's voice brain runs "
-            "on your Claude subscription, not an API key."
+            "on an authenticated agent CLI session, not an API key."
         ),
     )
 
@@ -794,8 +797,8 @@ async def run_checks(*, timeout: float | None = None) -> list[Check]:
     `warn` results after `timeout` seconds, not a hung or crashed server.
 
     The default budget is backend-aware: Hermes Agent spends ~15-30s on
-    plugin/MCP init before answering anything, so a 5s budget false-fails
-    every Hermes check at boot.
+    plugin/MCP init before answering anything, so the 5s Claude-sized
+    budget would false-fail every Hermes check at boot.
     """
     if timeout is None:
         timeout = 30.0 if _cli_backend() == "hermes" else DEFAULT_CHECK_TIMEOUT

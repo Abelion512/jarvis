@@ -71,6 +71,8 @@ async def test_a_window_that_stops_being_reported_stops_being_drawn():
         await page.wait_for_function(
             "document.querySelectorAll('.usage-gauge').length === 1",
             timeout=WAIT_MS)
+        assert await page.locator(".usage-gauge").count() == 1
+        assert await page.locator(".usage-unavailable").count() == 0
 
 
 async def test_a_measured_reading_draws_its_gauges():

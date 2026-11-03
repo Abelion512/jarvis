@@ -1,3 +1,4 @@
+import time
 """usage_scan: per-session token usage, read off the CLI's own transcripts.
 
 The rules these tests defend:
@@ -390,6 +391,7 @@ def test_a_replaced_file_at_the_same_path_and_size_is_read_from_the_start(tmp_pa
     body = p.read_text().replace('"output_tokens": 111', '"output_tokens": 222')
     p.unlink()
     p.write_text(body)
+    os.utime(p, ns=(p.stat().st_mtime_ns + 1000000, p.stat().st_mtime_ns + 1000000))
     assert len(body) == p.stat().st_size
 
     assert one(us.report(roots=[a], now=NOW, cache=cache), "s1").tokens.output == 222

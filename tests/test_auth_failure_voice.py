@@ -82,6 +82,7 @@ async def test_on_brain_state_never_raises_with_no_speech(wired, monkeypatch):
     await server._on_brain_state("failed", {})
     await server._on_brain_state("restarting", {})
     await server._on_brain_state("rate_limited", {"resets_at": 0})
+    assert server.speech is None  # the no-speech path ran, not the normal one
 
 
 @pytest.mark.asyncio
@@ -154,3 +155,4 @@ async def test_handle_utterance_never_raises_with_no_speech(wired, monkeypatch):
     monkeypatch.setattr(server, "brain_instance",
                         FakeBrain(ready=False, failed=True, failure_reason="auth"))
     await server._handle_utterance("are you there")   # must not raise
+    assert server.speech is None  # the no-speech path ran, not the normal one

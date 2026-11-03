@@ -266,6 +266,7 @@ async def test_a_broken_announcement_never_escapes_the_callback(wired,
 
     monkeypatch.setattr(server, "_spawn", explode)
     server._on_run_event(_finished())          # must not raise
+    assert server._pending_run_completions == ["chitauri"]  # queued, then swallowed
 
 
 @pytest.mark.asyncio
@@ -276,6 +277,7 @@ async def test_no_speech_configured_is_silent_not_fatal(wired, monkeypatch):
     await _drain(server)
     server._on_run_event(_finished(status="failed"))
     await _drain(server)
+    assert server._pending_run_completions == ["chitauri"]  # silent, nothing lost
 
 
 def test_the_voice_path_is_actually_subscribed(wired):

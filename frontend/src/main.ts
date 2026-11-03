@@ -94,7 +94,7 @@ const voiceInput = createVoiceInput(
   },
   (text: string) => {
     micMonitor.sawSpeech();
-    socket.send({ type: "interim", text });
+    socket.send({ type: "interim", text, lang: spokenLang });
   },
   (msg: string) => {
     showError(msg);
