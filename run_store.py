@@ -39,7 +39,6 @@ _UPDATABLE = frozenset({
 def _connect() -> sqlite3.Connection:
     # ponytail: journal_mode=WAL is persistent per-DB, set once in init_db —
     # re-setting it here cost ~0.4ms per query (measured 100x: 0.095s → 0.052s).
-    # No ceiling: identical durability, verified journal_mode=wal after init.
     conn = sqlite3.connect(str(db_path()))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")

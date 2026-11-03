@@ -47,13 +47,10 @@ never by being re-described somewhere else.
 - [ ] Faster-model decision (`JARVIS_BRAIN_MODEL`) + Hermes plugin trim
       (69 discovered; ~10s/turn). Human call, then one-line change + note.
       (2026-10-15: current `kgw/kilo-auto/free`; decision AWAITS HUMAN.)
-- [x] Full suite green on the final tree (last full run predates the
+- [ ] Full suite green on the final tree (last full run predates the
       chunk-voice/filler/override/notice/hits edits). Acceptance: only the
       3 known pre-existing HEAD failures remain.
-      (2026-10-15: 2482 passed; the only failures are the 3 pre-existing
-      HEAD ones — 2× test_private_data + 1× test_usage_scan, verified
-      identical on pristine 16e37bd worktree. Two regressions my batch
-      introduced — brain --tools pin, tool-argument echo — fixed.)
+      (2026-10-15: full pytest running in background at commit time.)
 
 ## Deliberately not doing
 
