@@ -30,6 +30,14 @@ def wired(monkeypatch, tmp_path):
     importlib.reload(run_store)
     import server as server_module
     importlib.reload(server_module)
+    # TestClient triggers lifespan, which starts the real SessionWatcher and
+    # reads the developer's actual Claude Code sessions from disk. Stub it
+    # out so tests that don't explicitly set `session_watcher` get an empty
+    # roster, not whatever happens to be open on the machine running the suite.
+    async def _no_watcher(*args, **kwargs):
+        return None
+    monkeypatch.setattr(server_module, "start_session_watcher", _no_watcher)
+    monkeypatch.setattr(server_module, "stop_session_watcher", _no_watcher)
     run_store.init_db()
     return server_module, run_store
 
